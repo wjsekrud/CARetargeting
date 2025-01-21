@@ -13,11 +13,13 @@ class NewVertexExporter:
     def assign_vertex_groups(self):
         """버텍스 그룹이 없는 경우, 본 인덱스 기반 그룹 생성"""
         bone_map = {}
+
         for vertex_idx, vertex in enumerate(self.mesh.vertices):
             max_weight = 0
             primary_bone = None
 
             for group in vertex.groups:
+
                 weight = group.weight
                 if weight > max_weight:
                     max_weight = weight
@@ -67,12 +69,13 @@ class NewVertexExporter:
         """해당 버텍스에 영향을 주는 본 가중치 정보 수집"""
         weights = []
         for group in self.mesh.vertices[vertex_idx].groups:
-            weight = group.weight
-            if weight > 0.5:
-                weights.append({
-                    'bone_index': group.group,
-                    'weight': weight
-                })
+            if group.group < 22:
+                weight = group.weight
+                if weight > 0.5:
+                    weights.append({
+                        'bone_index': group.group,
+                        'weight': weight
+                    })
         return weights
 
     def _get_primary_group(self, vertex_idx):

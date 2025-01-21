@@ -30,6 +30,7 @@ def find_closest_keeper_parent(bone, keep_bones):
 
 def find_deformed_mesh(armature):
     """아마추어에 의해 변형되는 메시 오브젝트를 찾습니다."""
+    meshes =[]
     for obj in bpy.data.objects:
         if obj.type == 'MESH' and obj.find_armature() == armature:
             return obj
@@ -78,7 +79,7 @@ def transfer_weights_to_parent(armature, bone_name, keep_bones):
         
         # 가중치를 한 번에 전달
         for idx, weight in zip(vertex_indices_to_update, weights_to_update):
-            parent_group.add([idx], weight, 'ADD')
+            parent_group.add([idx], weight, 'REPLACE')
 
 def cleanup_armature(fbx_path, bones_list_path, output_path):
     """메인 처리 함수"""
@@ -122,7 +123,7 @@ def cleanup_armature(fbx_path, bones_list_path, output_path):
     
     # 포즈 모드로 전환하여 가중치 전달
     bpy.ops.object.mode_set(mode='POSE')
-    for bone_name in bones_to_remove:
+    for bone_name in bones_to_remove[::-1]:
         transfer_weights_to_parent(armature, bone_name, keep_bones)
     
     # 다시 편집 모드로 전환하여 본 삭제

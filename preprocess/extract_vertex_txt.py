@@ -67,12 +67,14 @@ class NewVertexExporter:
         """해당 버텍스에 영향을 주는 본 가중치 정보 수집"""
         weights = []
         for group in self.mesh.vertices[vertex_idx].groups:
-            weight = group.weight
-            if weight > 0.5:
-                weights.append({
-                    'bone_index': group.group,
-                    'weight': weight
-                })
+
+            if group.group < 22:
+                weight = group.weight
+                if weight > 0.5:
+                    weights.append({
+                        'bone_index': group.group,
+                        'weight': weight
+                    })
         return weights
 
     def _get_primary_group(self, vertex_idx):
@@ -103,6 +105,7 @@ class NewVertexExporter:
             f.write("Triangles:\n")
             for triangle in triangles:
                 indices = ",".join(map(str, triangle['indices']))
+                f.write(f"{indices}\n")
 
 class NewVertex:
     """다른 모듈에서 사용할 NewVertex 클래스"""
