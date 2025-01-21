@@ -23,9 +23,11 @@ def find_closest_keeper_parent(bone, keep_bones):
     """유지할 본 목록에 있는 가장 가까운 부모 본을 찾습니다."""
     current = bone
     while current and current.parent:
+        
         current = current.parent
         if should_keep_bone(current.name, keep_bones):
             return current
+        
     return None
 
 def find_deformed_mesh(armature):
@@ -33,14 +35,14 @@ def find_deformed_mesh(armature):
     meshes =[]
     for obj in bpy.data.objects:
         if obj.type == 'MESH' and obj.find_armature() == armature:
-            return obj
-    return None
+            meshes.append(obj)
+    return meshes
 
 def transfer_weights_to_parent(armature, bone_name, keep_bones):
     """삭제될 본에 할당된 가중치를 유지할 가장 가까운 부모 본으로 전달합니다."""
     # 스키닝된 메시 찾기
-    mesh_obj = find_deformed_mesh(armature)
-    if not mesh_obj:
+    mesh_objs = find_deformed_mesh(armature)
+    if mesh_objs == []:
         print(f"Warning: No deformed mesh found for armature")
         return
     
@@ -56,30 +58,31 @@ def transfer_weights_to_parent(armature, bone_name, keep_bones):
         
     parent_name = keeper_parent.name
     
-    # 메시의 각 버텍스 그룹을 순회
-    vertex_indices_to_update = []
-    weights_to_update = []
-    
-    for vertex in mesh_obj.data.vertices:
-        total_weight = 0
-        for group in vertex.groups:
-            if mesh_obj.vertex_groups[group.group].name == bone_name:
-                total_weight += group.weight
-                group.weight = 0  # 현재 본의 가중치를 0으로 설정
-                
-        if total_weight > 0:
-            vertex_indices_to_update.append(vertex.index)
-            weights_to_update.append(total_weight)
-    
-    if vertex_indices_to_update:
-        # 부모 본의 버텍스 그룹을 찾거나 생성
-        parent_group = mesh_obj.vertex_groups.get(parent_name)
-        if not parent_group:
-            parent_group = mesh_obj.vertex_groups.new(name=parent_name)
+    for mesh_obj in mesh_objs:
+        vertex_indices_to_update = []
+        weights_to_update = []
+
+        for vertex in mesh_obj.data.vertices:
+            total_weight = 0
+            for group in vertex.groups: 
+                if mesh_obj.vertex_groups[group.group].name == bone_name:
+                    print(bone_name)
+                    total_weight += group.weight
+                    group.weight = 0  # 현재 본의 가중치를 0으로 설정
+                    
+            if total_weight > 0:
+                vertex_indices_to_update.append(vertex.index)
+                weights_to_update.append(total_weight)
         
-        # 가중치를 한 번에 전달
-        for idx, weight in zip(vertex_indices_to_update, weights_to_update):
-            parent_group.add([idx], weight, 'REPLACE')
+        if vertex_indices_to_update:
+            # 부모 본의 버텍스 그룹을 찾거나 생성
+            parent_group = mesh_obj.vertex_groups.get(parent_name)
+            if not parent_group:
+                parent_group = mesh_obj.vertex_groups.new(name=parent_name)
+            
+            # 가중치를 한 번에 전달
+            for idx, weight in zip(vertex_indices_to_update, weights_to_update):
+                parent_group.add([idx], weight, 'ADD')
 
 def cleanup_armature(fbx_path, bones_list_path, output_path):
     """메인 처리 함수"""
@@ -123,7 +126,7 @@ def cleanup_armature(fbx_path, bones_list_path, output_path):
     
     # 포즈 모드로 전환하여 가중치 전달
     bpy.ops.object.mode_set(mode='POSE')
-    for bone_name in bones_to_remove[::-1]:
+    for bone_name in bones_to_remove:
         transfer_weights_to_parent(armature, bone_name, keep_bones)
     
     # 다시 편집 모드로 전환하여 본 삭제

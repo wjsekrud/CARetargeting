@@ -2,7 +2,7 @@ import bpy
 import bmesh
 from pathlib import Path
 import numpy as np
-from mathutils import Vector, Matrix
+from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 import math
 import sys
