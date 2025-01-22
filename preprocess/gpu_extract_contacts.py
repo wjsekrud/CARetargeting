@@ -1,10 +1,9 @@
 from pathlib import Path
 import sys
 sys.path.append("../")
-from utils.CUDAkernels import cuda_contact_kernel, cuda_transform_kernel
 from utils.newvertex import NewVertex
 from utils.bvhParser import BVHAnimation
-
+from utils.bvh_accelerator import CUDABVHLib
 import pycuda.driver as cuda
 import pycuda.autoinit
 from pycuda.compiler import SourceModule
@@ -18,18 +17,14 @@ class CUDAContactDetector:
         self.bvh_parser = BVHAnimation(bvh_file_path)
         print("BVHParsing complete")
         self.vertex_groups = self.create_vertex_groups()
-        print("CreateVertexGroup complete")
+        self.cuda_lib = CUDABVHLib()
         self.frame_start = 0
         self.frame_end = self.bvh_parser.num_frames - 1
+        self.hand_bvh = None
+        self.other_bvh = None
 
         # Initialize CUDA
-        print("INIT CUDA : transform")
-        self.mod_transform = SourceModule(cuda_transform_kernel)
-        print("INIT CUDA : contact")
-        self.mod_contact = SourceModule(cuda_contact_kernel)
-        self.transform_kernel = self.mod_transform.get_function("transform_vertices")
-        self.contact_kernel = self.mod_contact.get_function("detect_contacts")
-        
+
         # Load vertices and animation data
         self.vertices, self.triangles = self.load_vertex_data(vertex_file_path)
         self.bvh_parser.load(bvh_file_path)
@@ -65,136 +60,101 @@ class CUDAContactDetector:
     def detect_contacts_for_frame(self, frame):
         """특정 프레임에서의 contact detection 수행"""
         print(f"Processing frame {frame}")
-        
-        # 1. 현재 프레임의 bone matrices 가져오기
-        bone_matrices = self.get_bone_matrices(frame)
-        d_bone_matrices = cuda.mem_alloc(bone_matrices.nbytes)
-        cuda.memcpy_htod(d_bone_matrices, bone_matrices)
-        
-        # 2. Vertex 변환 수행
+
         block_size = 256
         grid_size = (len(self.vertices) + block_size - 1) // block_size
         
-        self.transform_kernel(
-            self.d_positions,
-            d_bone_matrices,
-            self.d_bone_indices,
-            self.d_weights,
-            self.d_transformed,
-            np.int32(len(self.vertices)),
-            np.int32(max(len(v.bone_weights) for v in self.vertices)),
-            block=(block_size, 1, 1),
-            grid=(grid_size, 1)
+        # 1. 현재 프레임의 bone matrices 가져오기
+        bone_matrices = self.get_bone_matrices(frame).reshape(-1)
+        d_bone_matrices = cuda.mem_alloc(bone_matrices.nbytes)
+        cuda.memcpy_htod(d_bone_matrices, bone_matrices)
+
+        # 2. Hand와 other vertices 분리
+        hand_indices = self.get_hand_vertices()
+        other_indices = self.get_non_hand_vertices()
+
+        max_weights = max(len(v.bone_weights) for v in self.vertices) #본마다 할당된 가중치 본 최대 개수는 1
+
+        bone_indices = np.zeros((len(self.vertices)), dtype=np.int32)
+        weights = np.zeros((len(self.vertices)), dtype=np.float32)
+        for i, vertex in enumerate(self.vertices):
+            for j, weight_info in enumerate(vertex.bone_weights):
+                bone_indices[i] = weight_info['bone_index']
+                weights[i] = weight_info['weight']
+        
+        # 3. Vertex positions 계산 (스키닝)
+        current_positions = np.zeros_like(self.vertex_positions).reshape(-1)
+        vertex_positions_flat = self.vertex_positions.copy().reshape(-1)
+
+        print(current_positions)
+        self.cuda_lib.compute_skinning(
+            vertex_positions_flat,
+            bone_matrices,
+            bone_indices,
+            weights,
+            current_positions,
+            np.int32(len(self.vertex_positions)),
+            block= (256,1,1),
+            grid = (grid_size,1)
         )
         
-        # 3. 손과 비손 vertex 구분
-        hand_indices = np.array(self.get_hand_vertices(), dtype=np.int32)
-        other_indices = np.array(self.get_non_hand_vertices(), dtype=np.int32)
-        #print(hand_indices)
-        
+        print("passed skinninga")
+        '''
+        next_positions = np.zeros_like(self.vertex_positions)
         # 4. 현재 프레임과 다음 프레임의 위치 계산 (velocity 계산용)
-        if frame < self.frame_end:
-            next_bone_matrices = self.get_bone_matrices(frame + 1)
-            d_next_bone_matrices = cuda.mem_alloc(next_bone_matrices.nbytes)
-            cuda.memcpy_htod(d_next_bone_matrices, next_bone_matrices)
-            
-            d_next_transformed = cuda.mem_alloc(self.vertex_positions.nbytes)
-            self.transform_kernel(
-                self.d_positions,
-                d_next_bone_matrices,
-                self.d_bone_indices,
-                self.d_weights,
-                d_next_transformed,
-                np.int32(len(self.vertices)),
-                np.int32(max(len(v.bone_weights) for v in self.vertices)),
-                block=(block_size, 1, 1),
-                grid=(grid_size, 1)
-            )
-        else:
-            # 마지막 프레임의 경우 현재 위치를 다음 위치로도 사용
-            d_next_transformed = self.d_transformed
+        next_frame = min(frame + 1, self.frame_end)
+        next_bone_matrices = self.get_bone_matrices(next_frame)
+        next_positions = self.cuda_lib.compute_skinning(
+            self.vertex_positions,
+            next_bone_matrices,
+            bone_indices,
+            weights,
+            next_positions,
+            len(self.vertices),
+            block=(256,1,1)
+        )
+        #'''
+        # Velocities 계산
+        velocities = next_positions - current_positions
         
         # 5. Hand와 other vertices의 위치와 속도 데이터 준비
-        positions = np.zeros((len(self.vertices), 3), dtype=np.float32)
-        cuda.memcpy_dtoh(positions, self.d_transformed)
-        
-        next_positions = np.zeros((len(self.vertices), 3), dtype=np.float32)
-        cuda.memcpy_dtoh(next_positions, d_next_transformed)
-        
-        velocities = (next_positions - positions) / self.bvh_parser.frame_time
-        #print(positions[hand_indices])
-        # Hand vertices 데이터
-        hand_positions = positions[hand_indices]
+        hand_positions = current_positions[hand_indices]
         hand_velocities = velocities[hand_indices]
-        
-        # Other vertices 데이터
-        other_positions = positions[other_indices]
+        other_positions = current_positions[other_indices]
         other_velocities = velocities[other_indices]
         
-        # GPU 메모리 할당
-        d_hand_positions = cuda.mem_alloc(hand_positions.nbytes)
-        d_hand_velocities = cuda.mem_alloc(hand_velocities.nbytes)
-        d_other_positions = cuda.mem_alloc(other_positions.nbytes)
-        d_other_velocities = cuda.mem_alloc(other_velocities.nbytes)
+        # 6. BVH 구축 (첫 프레임이거나 필요한 경우)
+        if self.hand_bvh is None:
+            self.hand_bvh, d_hand_bvh = self.cuda_lib.create_bvh(hand_positions)
+        if self.other_bvh is None:
+            self.other_bvh, d_other_bvh = self.cuda_lib.create_bvh(other_positions)
         
-        # 데이터 전송
-        cuda.memcpy_htod(d_hand_positions, hand_positions)
-        cuda.memcpy_htod(d_hand_velocities, hand_velocities)
-        cuda.memcpy_htod(d_other_positions, other_positions)
-        cuda.memcpy_htod(d_other_velocities, other_velocities)
-        
-        # 6. Contact detection 결과를 저장할 메모리 준비
-        max_contacts = min(1000, len(hand_indices) * len(other_indices))  # 최대 접촉 쌍 수 제한
-        contact_pairs = np.zeros(max_contacts * 2 + 1, dtype=np.int32)  # +1 for count
-        distances = np.zeros(max_contacts, dtype=np.float32)
-        
-        d_contact_pairs = cuda.mem_alloc(contact_pairs.nbytes)
-        d_distances = cuda.mem_alloc(distances.nbytes)
-        
-        cuda.memcpy_htod(d_contact_pairs, contact_pairs)
-        cuda.memcpy_htod(d_distances, distances)
-        
-        # 7. Contact detection 커널 실행
-        block_size = (16, 16, 1)
-        grid_size = (
-            (len(hand_indices) + block_size[0] - 1) // block_size[0],
-            (len(other_indices) + block_size[1] - 1) // block_size[1]
+        # 7. Contact detection 실행
+        contact_pairs = []
+        distances = []
+        contactCount = [0]
+        contacts, distances = self.cuda_lib.detect_vertex_contacts(
+            d_hand_bvh,
+            d_other_bvh,
+            hand_positions,
+            hand_velocities,
+            other_positions,
+            other_velocities,
+            contact_pairs,
+            distances,
+            contactCount,
+            1
         )
         
-        self.contact_kernel(
-            d_hand_positions,
-            d_other_positions,
-            d_hand_velocities,
-            d_other_velocities,
-            d_contact_pairs,
-            d_distances,
-            np.int32(len(hand_indices)),
-            np.int32(len(other_indices)),
-            np.float32(0.02),  # distance threshold (2cm)
-            np.float32(0.9),   # velocity threshold (cosine similarity)
-
-        )
+        # 8. 결과 변환
+        contact_pairs = []
+        for i in range(len(contacts)):
+            hand_idx = hand_indices[contacts[i][0]]
+            other_idx = other_indices[contacts[i][1]]
+            if distances[i] <= 0.02:  # 2cm threshold
+                contact_pairs.append((hand_idx, other_idx))
         
-        # 8. 결과 가져오기
-        cuda.memcpy_dtoh(contact_pairs, d_contact_pairs)
-        cuda.memcpy_dtoh(distances, d_distances)
-        print(f"distances: {distances}")
-        print(f"pairs: {contact_pairs}")
-        # 9. 메모리 정리
-        if frame < self.frame_end:
-            d_next_bone_matrices.free()
-            if d_next_transformed != self.d_transformed:
-                d_next_transformed.free()
-        d_bone_matrices.free()
-        d_hand_positions.free()
-        d_hand_velocities.free()
-        d_other_positions.free()
-        d_other_velocities.free()
-        d_contact_pairs.free()
-        d_distances.free()
-        
-        # 10. 결과 처리 및 반환
-        return self.process_contact_results(frame, contact_pairs, distances)
+        return self.process_contact_results(frame, contact_pairs)
     
     def get_bone_matrices(self, frame):
         """현재 프레임의 bone matrices를 가져옴"""
@@ -309,14 +269,11 @@ class CUDAContactDetector:
                     for pair in data['contactPolygonPairs']:
                         f.write(f"{int(pair[0])},{int(pair[1])}|")
                     f.write("\n")
-            
+
 def main():
 
     characters = ["Remy"]
 
-    # CUDA 사용 여부 결정
-    use_cuda = True  # 환경 변수나 설정 파일에서 읽어올 수 있음
-    
     for char_name in characters:
         index = 0
         bvh_files = list(Path(f"../dataset/Animations/bvhs/{char_name}").glob("*.bvh"))
