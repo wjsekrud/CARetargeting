@@ -1,80 +1,25 @@
-import bpy
-import bmesh
 from pathlib import Path
+import sys
+sys.path.append("../")
+from utils import BaseContactDetector
+from utils.CUDAkernels import cuda_contact_kernel, cuda_transform_kernel
+from utils.newvertex import NewVertex
+
+import pycuda.autoinit
+import pycuda.driver as cuda
+from pycuda.compiler import SourceModule
 import numpy as np
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
-import math
-import sys
-sys.path.append("../")
 
-from utils import validate_contacts
 
-class NewVertex:
-    def __init__(self):
-        self.position = [0.0, 0.0, 0.0]
-        self.vertex_group = 0
-        self.bone_weights = []
 
-    @classmethod
-    def load_from_simple_txt(cls, file_path):
-        """단순 텍스트 파일에서 NewVertex 객체들을 로드"""
-        vertices = []
-        triangles = []
 
-        with open(file_path, 'r') as f:
-            lines = f.readlines()
-            vertex_count = int(lines[0].split(":")[1])
-            triangle_count = int(lines[1].split(":")[1])
 
-            vertex_lines = lines[3:3 + vertex_count]
-            for line in vertex_lines:
-                position, bone_weight, vertex_group = line.strip().split('|')
-                new_vertex = cls()
-                new_vertex.position = list(map(float, position.split(',')))
-                new_vertex.vertex_group = int(vertex_group)
-                new_vertex.bone_weights = [
-                    {
-                        'bone_index': int(bw.split(':')[0]),
-                        'weight': float(bw.split(':')[1]),
-                    } for bw in bone_weight.split(',') if bw
-                ]
-                vertices.append(new_vertex)
-
-            triangle_lines = lines[4 + vertex_count:]
-            for line in triangle_lines:
-                triangles.append({
-                    'indices': list(map(int, line.split(','))),
-                })
-
-        return vertices, triangles
-    
-class ContactDetector:
+class CPUContactDetector(BaseContactDetector):
     def __init__(self, vertex_file_path, bvh_file_path):
-        self.vertices, self.triangles = NewVertex.load_from_simple_txt(vertex_file_path)
-        self.load_animation(bvh_file_path)
-        self.vertex_groups = self.create_vertex_groups()
-        
-    def load_animation(self, bvh_file_path):
-        """BVH 파일 로드 및 애니메이션 데이터 추출"""
-        # 기존 데이터 초기화
-        bpy.ops.wm.read_factory_settings(use_empty=True)
-        
-        # BVH 파일 import
-        bpy.ops.import_anim.bvh(
-            filepath=str(bvh_file_path),
-            rotate_mode='NATIVE',
-            axis_forward='-Z',
-            axis_up='Y',
-            update_scene_fps=True,
-            use_fps_scale=False
-        )
-        
-        # 애니메이션 정보 저장
-        self.armature = bpy.context.selected_objects[0]
-        self.frame_start = bpy.context.scene.frame_start
-        self.frame_end = bpy.context.scene.frame_end
-        
+        super.init(vertex_file_path, bvh_file_path)
+                
     def create_vertex_groups(self):
         """NewVertex의 vertex_group 정보를 기반으로 그룹화"""
         groups = {}
@@ -172,7 +117,8 @@ class ContactDetector:
                         closest_pairs = self.find_closest_pairs(
                             hand_vertices, other_vertices, frame)
                         contact_pairs.extend(closest_pairs[:3])
-                        print(contact_pairs, other_id)
+                        #print(contact_pairs, other_id)
+                        #validate_contacts.validate_contact(frame, self.vertices, self.create_contact_struct(contact_pairs, frame), Path("../dataset/"))
                         
                 other_bmesh.free()
             hand_bmesh.free()
@@ -235,61 +181,212 @@ class ContactDetector:
         pairs.sort(key=lambda x: x[0])
         return [(p[1][0], p[1][1]) for p in pairs]
         
-    def create_contact_struct(self, contact_pairs, frame):
-        """Contact Struct 생성"""
-        print(contact_pairs)
+
+class CUDAContactDetector(BaseContactDetector):
+    def __init__(self, vertex_file_path, bvh_file_path):
+        # Initialize CUDA
+        self.mod_transform = SourceModule(cuda_transform_kernel)
+        self.mod_contact = SourceModule(cuda_contact_kernel)
+        self.transform_kernel = self.mod_transform.get_function("transform_vertices")
+        self.contact_kernel = self.mod_contact.get_function("detect_contacts")
+        
+        # Load vertices and animation data
+        self.vertices, self.triangles = self.load_vertex_data(vertex_file_path)
+        self.load_animation(bvh_file_path)
+        
+        # Prepare CUDA memory
+        self.prepare_cuda_memory()
+        
+    def prepare_cuda_memory(self):
+        # Allocate memory for vertex positions
+        vertex_positions = np.array([v.position for v in self.vertices], dtype=np.float32)
+        self.d_positions = cuda.mem_alloc(vertex_positions.nbytes)
+        cuda.memcpy_htod(self.d_positions, vertex_positions)
+        
+        # Allocate memory for bone weights and indices
+        max_weights = max(len(v.bone_weights) for v in self.vertices)
+        bone_indices = np.zeros((len(self.vertices), max_weights), dtype=np.int32)
+        weights = np.zeros((len(self.vertices), max_weights), dtype=np.float32)
+        
+        for i, vertex in enumerate(self.vertices):
+            for j, weight_info in enumerate(vertex.bone_weights):
+                bone_indices[i, j] = weight_info['bone_index']
+                weights[i, j] = weight_info['weight']
+        
+        self.d_bone_indices = cuda.mem_alloc(bone_indices.nbytes)
+        self.d_weights = cuda.mem_alloc(weights.nbytes)
+        cuda.memcpy_htod(self.d_bone_indices, bone_indices)
+        cuda.memcpy_htod(self.d_weights, weights)
+        
+        # Allocate memory for transformed positions
+        self.d_transformed = cuda.mem_alloc(vertex_positions.nbytes)
+        
+    def detect_contacts_for_frame(self, frame):
+        # Update bone matrices for current frame
+        bone_matrices = self.get_bone_matrices(frame)
+        d_bone_matrices = cuda.mem_alloc(bone_matrices.nbytes)
+        cuda.memcpy_htod(d_bone_matrices, bone_matrices)
+        
+        # Transform vertices
+        block_size = 256
+        grid_size = (len(self.vertices) + block_size - 1) // block_size
+        
+        self.transform_kernel(
+            self.d_positions,
+            d_bone_matrices,
+            self.d_bone_indices,
+            self.d_weights,
+            self.d_transformed,
+            np.int32(len(self.vertices)),
+            np.int32(1),
+            block=(block_size, 1, 1),
+            grid=(grid_size, 1)
+        )
+        
+        # Get hand and non-hand vertices
+        hand_indices = self.get_hand_vertices()
+        other_indices = self.get_non_hand_vertices()
+        
+        # Prepare contact detection
+        max_contacts = 1000  # Adjust based on your needs
+        contact_pairs = np.zeros(max_contacts * 2 + 1, dtype=np.int32)
+        distances = np.zeros(max_contacts, dtype=np.float32)
+        
+        d_contact_pairs = cuda.mem_alloc(contact_pairs.nbytes)
+        d_distances = cuda.mem_alloc(distances.nbytes)
+        
+        # Launch contact detection kernel
+        block_size = (16, 16, 1)
+        grid_size = (
+            (len(hand_indices) + block_size[0] - 1) // block_size[0],
+            (len(other_indices) + block_size[1] - 1) // block_size[1]
+        )
+        
+        self.contact_kernel(
+            self.d_transformed,
+            self.d_transformed,
+            np.float32(0.02),  # distance threshold (2cm)
+            np.float32(0.9),   # velocity threshold
+            block=block_size,
+            grid=grid_size
+        )
+        
+        # Get results
+        cuda.memcpy_dtoh(contact_pairs, d_contact_pairs)
+        cuda.memcpy_dtoh(distances, d_distances)
+        
+        return self.process_contact_results(frame, contact_pairs, distances)
+    
+    def get_bone_matrices(self, frame):
+        """현재 프레임의 bone matrices를 가져옴"""
+        bpy.context.scene.frame_set(frame)
+        matrices = []
+        
+        for bone in self.armature.pose.bones:
+            # World space에서의 bone matrix 계산
+            matrix = self.armature.matrix_world @ bone.matrix
+            # numpy array로 변환
+            matrix_array = np.array(matrix.to_4x4(), dtype=np.float32)
+            matrices.append(matrix_array)
+            
+        return np.array(matrices)
+    
+    def get_hand_vertices(self):
+        """손에 해당하는 vertex indices 반환"""
+        hand_vertices = []
+        for i, vertex in enumerate(self.vertices):
+            # vertex의 주요 영향을 받는 bone이 hand bone인 경우
+            max_weight = 0
+            main_bone = None
+            for weight_info in vertex.bone_weights:
+                if weight_info['weight'] > max_weight:
+                    max_weight = weight_info['weight']
+                    main_bone = self.armature.pose.bones[weight_info['bone_index']]
+            
+            if main_bone and 'hand' in main_bone.name.lower():
+                hand_vertices.append(i)
+        return hand_vertices
+    
+    def get_non_hand_vertices(self):
+        """손이 아닌 부분의 vertex indices 반환"""
+        all_vertices = set(range(len(self.vertices)))
+        hand_vertices = set(self.get_hand_vertices())
+        return list(all_vertices - hand_vertices)
+    
+    def calculate_velocities(self, positions_current, positions_next):
+        """현재 프레임과 다음 프레임 사이의 속도 계산"""
+        velocities = positions_next - positions_current
+        return velocities
+    
+    def process_contact_results(self, frame, contact_pairs, distances):
+        """CUDA 계산 결과를 contact struct 형식으로 변환"""
+        num_contacts = contact_pairs[0]  # 첫 번째 요소는 접촉 쌍의 개수
+        
+        processed_pairs = []
+        for i in range(num_contacts):
+            hand_idx = contact_pairs[i * 2 + 1]
+            other_idx = contact_pairs[i * 2 + 2]
+            distance = distances[i]
+            
+            if distance <= 0.02:  # 2cm threshold
+                processed_pairs.append((hand_idx, other_idx))
+        
         return {
             'frame': frame,
-            'contactPolygonPairs': [Vector((p[0], p[1])) 
-                                  for p in contact_pairs],
-            'localDistanceField': [],  # 추후 구현
-            'geodesicDistance': []     # 추후 구현
+            'contactPolygonPairs': [Vector((p[0], p[1])) for p in processed_pairs],
+            'localDistanceField': [],  # 필요한 경우 구현
+            'geodesicDistance': []     # 필요한 경우 구현
         }
+    
+    def load_vertex_data(self, vertex_file_path):
+        """vertex 파일에서 데이터 로드"""
+        return NewVertex.load_from_simple_txt(vertex_file_path)
         
+    def create_vertex_groups(self):
+        """vertex group 정보 생성"""
+        groups = {}
+        for i, vertex in enumerate(self.vertices):
+            group_id = vertex.vertex_group
+            if group_id not in groups:
+                groups[group_id] = []
+            groups[group_id].append(i)
+        return groups
+
+
     def process_all_frames(self, output_dir, index):
-        """모든 프레임에 대해 contact detection 수행 및 결과 저장"""
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
+        
         contact_data = []
-        data = {}
         for frame in range(self.frame_start, self.frame_end + 1):
             data = self.detect_contacts_for_frame(frame)
             contact_data.append(data)
-            if data['contactPolygonPairs'] != []:
-                print("validatecontacts")
-                #validate_contacts.validate_contact(frame, self.vertices, contact_data[-1], Path("../dataset/"))
-            # 결과를 파일로 저장
+            
+            # Save results
             output_file = output_path / f"{index}.txt"
             self.save_contact_data(contact_data, output_file)
             
-            
-    def save_contact_data(self, contact_data, output_file):
-        """Contact data를 파일로 저장"""
-        with open(output_file, 'w') as f:
-            for data in contact_data:
-                if len(data['contactPolygonPairs']) > 1:
-                    f.write(f"{data['frame']}|")
-                    for pair in data['contactPolygonPairs']:
-                        f.write(f"{int(pair[0])},{int(pair[1])}|")
-                    f.write("\n")
-
-
-            
 def main():
 
-    characters = ["Y_bot"]
+    characters = ["Remy"]
 
+    # CUDA 사용 여부 결정
+    use_cuda = True  # 환경 변수나 설정 파일에서 읽어올 수 있음
+    
     for char_name in characters:
-        index=0
+        index = 0
         bvh_files = list(Path(f"../dataset/Animations/bvhs/{char_name}").glob("*.bvh"))
         vertex_file = Path(f"../dataset/vertexes/{char_name}_clean_vertices.txt")
+        detector_class = CUDAContactDetector if use_cuda else CPUContactDetector
+
         for animation in bvh_files:
             print(f"\nProcessing character: {char_name}")
-            detector = ContactDetector(vertex_file, animation)
+            
+            detector = detector_class(vertex_file, animation)
+            
             output_dir = Path(f"../dataset/Contacts/{char_name}")
             detector.process_all_frames(output_dir, index)
             index += 1
 
-    
 if __name__ == "__main__":
     main()

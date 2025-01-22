@@ -125,7 +125,7 @@ class AnimationProcessor:
 
 def main():
     # 처리할 캐릭터 이름 목록
-    characters = ["Y_bot"]  # 실제 캐릭터 이름으로 수정
+    characters = ["Remy", "Y_bot"]  # 실제 캐릭터 이름으로 수정
     
     for char_name in characters:
         print(f"\nProcessing character: {char_name}")

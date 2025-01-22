@@ -38,8 +38,10 @@ class ContactVisualizer:
         #bpy.ops.object.delete()
 
         # 기본 카메라 추가
-        bpy.ops.object.camera_add(location=(0, -5, 2.8), rotation=(90, 0, 0))
-        camera = bpy.context.active_object
+        if not bpy.context.scene.camera:
+            bpy.ops.object.camera_add(location=(0, -5, 2.8), rotation=(90, 0, 0))
+            camera = bpy.context.active_object
+            print(camera)
         
         # 여러 방향의 조명 추가
         # 정면 조명
@@ -69,7 +71,7 @@ class ContactVisualizer:
         top_light.energy = 10
         
         # 렌더링 설정
-        bpy.context.scene.render.engine = 'BLENDER_WORKBENCH'  # 더 빠른 렌더링을 위해 Eevee 사용
+        bpy.context.scene.render.engine = 'BLENDER_EEVEE_NEXT'  # 더 빠른 렌더링을 위해 Eevee 사용
 
         # 카메라를 활성 카메라로 설정
         bpy.context.scene.camera = camera
