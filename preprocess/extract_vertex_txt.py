@@ -1,15 +1,95 @@
 import bpy
-import struct
-import json
+import bmesh
+import heapq
+from collections import defaultdict
 from pathlib import Path
 import numpy as np
+from mathutils import Vector
 
 class NewVertexExporter:
     def __init__(self, mesh_obj):
         self.mesh_obj = mesh_obj
         self.vertex_groups = mesh_obj.vertex_groups
         self.mesh = mesh_obj.data
+        self.end_effectors = ['mixamorig:Head', 'mixamorig:LeftHand', 'mixamorig:RightHand', 'mixamorig:LeftToeBase', 'mixamorig:RightToeBase']
 
+    def calculate_geodesic_distance(self):
+        # bmesh 생성
+        bm = bmesh.new()
+        bm.from_mesh(self.mesh)
+        bm.edges.ensure_lookup_table()
+        
+        # 엔드 이펙터 버텍스 그룹 매핑
+        end_effector_vertices = defaultdict(list)
+        for vertex in self.mesh.vertices:
+            for group in vertex.groups:
+                group_name = self.vertex_groups[group.group].name
+                if group_name in self.end_effectors and group.weight > 0.5:
+                    end_effector_vertices[group_name].append(vertex.index)
+
+        def dijkstra(start_idx, bm):
+            distances = {v.index: float('inf') for v in bm.verts}
+            distances[start_idx] = 0
+            pq = [(0, start_idx)]
+            
+            while pq:
+                current_distance, current_vertex = heapq.heappop(pq)
+                
+                if current_distance > distances[current_vertex]:
+                    continue
+                    
+                for edge in bm.verts[current_vertex].link_edges:
+                    next_vertex = edge.other_vert(bm.verts[current_vertex])
+                    distance = edge.calc_length()
+                    new_distance = distances[current_vertex] + distance
+                    
+                    if new_distance < distances[next_vertex.index]:
+                        distances[next_vertex.index] = new_distance
+                        heapq.heappush(pq, (new_distance, next_vertex.index))
+            
+            return distances
+
+        # 모든 엔드 이펙터 쌍 간의 최대 거리 계산
+        max_geodesic_distance = 0
+
+        representative_vertices = {}
+        max_geodesic_distance = 0
+        processed_pairs = set()
+
+        bm.verts.ensure_lookup_table()
+        for i, (name1, vertices1) in enumerate(end_effector_vertices.items()):
+            for name2, vertices2 in list(end_effector_vertices.items())[i+1:]:
+                if (name1, name2) in processed_pairs:
+                    continue
+                
+                rep1 = rep2 = None
+
+                if name1 in representative_vertices:
+                    vertices1 = [representative_vertices[name1]]
+                if name2 in representative_vertices:
+                    vertices2 = [representative_vertices[name2]]
+
+                for v1 in vertices1:
+                    distances = dijkstra(v1, bm)
+                    for v2 in vertices2:
+                        if distances[v2] != float('inf'):
+                            max_geodesic_distance = max(max_geodesic_distance, distances[v2])
+                            rep1 = v1
+                            rep2 = v2
+
+                if name1 not in representative_vertices:
+                    representative_vertices[name1] = rep1
+                if name2 not in representative_vertices:
+                    representative_vertices[name2] = rep2
+
+                processed_pairs.add((name1, name2))
+                processed_pairs.add((name2, name1))
+                print(f"processed : {name1, name2}, distance: {max_geodesic_distance}")
+
+
+        bm.free()
+        return max_geodesic_distance
+    
     def assign_vertex_groups(self):
         """버텍스 그룹이 없는 경우, 본 인덱스 기반 그룹 생성"""
         bone_map = {}
@@ -29,6 +109,15 @@ class NewVertexExporter:
                     bone_map[primary_bone] = new_group
                 bone_map[primary_bone].add([vertex_idx], max_weight, 'REPLACE')
 
+    def get_mesh_height(self):
+        # 월드 공간에서의 바운딩 박스 좌표
+        world_bbox = [self.mesh_obj.matrix_world @ Vector(corner) for corner in self.mesh_obj.bound_box]
+        
+        # z축 최대/최소값 차이로 높이 계산
+        min_z = min(corner.z for corner in world_bbox)
+        max_z = max(corner.z for corner in world_bbox)
+        return max_z - min_z
+    
     def export_to_file(self, output_path):
         # 버텍스 그룹 생성
         self.assign_vertex_groups()
@@ -93,6 +182,10 @@ class NewVertexExporter:
     def _save_to_simple_txt(self, output_path, vertices, triangles):
         """단순 텍스트 형식으로 파일 저장"""
         with open(output_path, 'w') as f:
+            max_geodesic = self.calculate_geodesic_distance()
+
+            f.write(f"Height: {self.get_mesh_height()}\n")
+            f.write(f"MaxGeodesicDistance: {max_geodesic}\n")
             f.write(f"VertexCount: {len(vertices)}\n")
             f.write(f"TriangleCount: {len(triangles)}\n")
 
@@ -123,10 +216,11 @@ class NewVertex:
 
         with open(file_path, 'r') as f:
             lines = f.readlines()
-            vertex_count = int(lines[0].split(":")[1])
-            triangle_count = int(lines[1].split(":")[1])
+            height = int(lines[0].split(":")[1])
+            vertex_count = int(lines[1].split(":")[1])
+            triangle_count = int(lines[2].split(":")[1])
 
-            vertex_lines = lines[3:3 + vertex_count]
+            vertex_lines = lines[4:4 + vertex_count]
             for line in vertex_lines:
                 position, bone_weight, vertex_group = line.strip().split('|')
                 new_vertex = cls()

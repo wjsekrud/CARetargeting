@@ -1,7 +1,7 @@
 import bpy
 import os
 from pathlib import Path
-
+from mathutils import Vector
 
 
 def read_bone_names(filepath):
@@ -66,7 +66,6 @@ def transfer_weights_to_parent(armature, bone_name, keep_bones):
             total_weight = 0
             for group in vertex.groups: 
                 if mesh_obj.vertex_groups[group.group].name == bone_name:
-                    print(bone_name)
                     total_weight += group.weight
                     group.weight = 0  # 현재 본의 가중치를 0으로 설정
                     
@@ -138,6 +137,47 @@ def cleanup_armature(fbx_path, bones_list_path, output_path):
     
     # 오브젝트 모드로 복귀
     bpy.ops.object.mode_set(mode='OBJECT')
+
+    # 모든 메쉬 선택 후 부모 해제
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH':
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
+        else:
+            obj.select_set(False)
+    
+    
+    
+    # 메쉬 병합
+    bpy.ops.object.join()
+
+    
+
+    
+    # Remesh 수정자 적용
+    active_obj = bpy.context.active_object
+    remesh = active_obj.modifiers.new(name="Remesh", type='REMESH')
+    remesh.mode = 'VOXEL'
+    # 캐릭터 크기 계산
+    bbox_corners = [active_obj.matrix_world @ Vector(corner) for corner in active_obj.bound_box]
+    bbox_size = (max(v.x for v in bbox_corners) - min(v.x for v in bbox_corners),
+                max(v.y for v in bbox_corners) - min(v.y for v in bbox_corners),
+                max(v.z for v in bbox_corners) - min(v.z for v in bbox_corners))
+    character_height = bbox_size[2]  # Z축 높이
+    print(character_height)
+    
+    # 캐릭터 높이 기준 voxel size 계산 (기본 2m 캐릭터 기준 2.5cm로 설정)
+    BASE_HEIGHT = 2.0  # 기준 캐릭터 높이(m)
+    BASE_VOXEL_SIZE = 2  # 기준 voxel size(m)
+    remesh.voxel_size = (character_height / BASE_HEIGHT) * BASE_VOXEL_SIZE
+    bpy.ops.object.modifier_apply(modifier=remesh.name)
+    
+    # 자동 스키닝
+    active_obj.select_set(True)
+    armature.select_set(True)
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.parent_set(type='ARMATURE_AUTO')
     
     # 결과 FBX 저장
     bpy.ops.export_scene.fbx(
