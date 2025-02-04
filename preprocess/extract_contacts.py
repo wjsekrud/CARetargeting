@@ -8,9 +8,9 @@ import math
 import sys
 sys.path.append("../")
 
-from utils import validate_contacts
+from utils.NewVertex import NewVertex
 
-
+    
 class CachedBVHTree:
     def __init__(self, max_cache_size=100):
         self.cache = {}  # (group_id, frame) -> (bvh_tree, last_access_time, bmesh)
@@ -49,46 +49,6 @@ class CachedBVHTree:
             bmesh.free()
         self.cache.clear()
 
-class NewVertex:
-    def __init__(self):
-        self.position = [0.0, 0.0, 0.0]
-        self.vertex_group = 0
-        self.bone_weights = []
-
-    @classmethod
-    def load_from_simple_txt(cls, file_path):
-        """단순 텍스트 파일에서 NewVertex 객체들을 로드"""
-        vertices = []
-        triangles = []
-
-        with open(file_path, 'r') as f:
-            lines = f.readlines()
-            height = float(lines[0].split(":")[1])
-            vertex_count = int(lines[2].split(":")[1])
-            triangle_count = int(lines[3].split(":")[1])
-
-            vertex_lines = lines[5:5 + vertex_count]
-            for line in vertex_lines:
-                position, bone_weight, vertex_group = line.strip().split('|')
-                new_vertex = cls()
-                new_vertex.position = list(map(float, position.split(',')))
-                new_vertex.vertex_group = int(vertex_group)
-                new_vertex.bone_weights = [
-                    {
-                        'bone_index': int(bw.split(':')[0]),
-                        'weight': float(bw.split(':')[1]),
-                    } for bw in bone_weight.split(',') if bw
-                ]
-                vertices.append(new_vertex)
-
-            triangle_lines = lines[6 + vertex_count:]
-            for line in triangle_lines:
-                triangles.append({
-                    'indices': list(map(int, line.split(','))),
-                })
-
-        return vertices, triangles, height
-
 class ContactDetector:
     def __init__(self, vertex_file_path, bvh_file_path):
         self.vertices, self.triangles ,self.height= NewVertex.load_from_simple_txt(vertex_file_path)
@@ -108,7 +68,7 @@ class ContactDetector:
             axis_forward='-Z',
             axis_up='Y',
             update_scene_fps=True,
-            use_fps_scale=False
+            use_fps_scale=True
         )
         
         # 애니메이션 정보 저장
@@ -124,6 +84,7 @@ class ContactDetector:
             group_id = vertex.vertex_group
             if group_id not in groups:
                 groups[group_id] = []
+                print(f"newid: {group_id}")
             groups[group_id].append(i)
         return groups
 
@@ -277,8 +238,8 @@ class ContactDetector:
             'frame': frame,
             'contactPolygonPairs': [Vector((p[0], p[1])) 
                                   for p in contact_pairs],
-            'localDistanceField': [],  # 추후 구현
-            'geodesicDistance': []     # 추후 구현
+            #'localDistanceField': [],  # 추후 구현
+            #'geodesicDistance': []     # 추후 구현
         }
         
     def process_all_frames(self, output_dir, index):
@@ -316,7 +277,7 @@ class ContactDetector:
             
 def main():
 
-    characters = ["Y_bot", "Remy", "ch14_nonPBR"]
+    characters = [ "Y_bot", "Remy", "ch14_nonPBR"]
 
     for char_name in characters:
         index=0

@@ -103,7 +103,8 @@ class NewVertexExporter:
                     max_weight = weight
                     primary_bone = group.group
 
-            if primary_bone and max_weight >= 0.5:
+            #if primary_bone and max_weight >= 0.5:
+            if primary_bone and int(str(primary_bone)) < 22:
                 if primary_bone not in bone_map:
                     new_group = self.mesh_obj.vertex_groups.new(name=str(primary_bone))
                     bone_map[primary_bone] = new_group
@@ -159,11 +160,11 @@ class NewVertexExporter:
 
             if group.group < 22:
                 weight = group.weight
-                if weight > 0.5:
-                    weights.append({
-                        'bone_index': group.group,
-                        'weight': weight
-                    })
+                #if weight > 0.5:
+                weights.append({
+                    'bone_index': group.group,
+                    'weight': weight
+                })
         return weights
 
     def _get_primary_group(self, vertex_idx):
