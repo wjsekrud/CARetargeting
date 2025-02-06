@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 import sys
 sys.path.append("./")
 from utils.NewVertex import load_from_simple_txt 
+from utils.LBS import convert_weights_to_sparse
 from utils.bvhparser import BVHParser
 
 
@@ -26,6 +27,7 @@ class PrepDataloader(Dataset):
         tgt_v_path = Path(f"./dataset/vertexes/{tgt_name}_clean_vertices.txt")
         self.src_vertices, self.src_tris, self.src_h = load_from_simple_txt(src_v_path)
         self.tgt_vertices, self.tgt_tris, self.tgt_h = load_from_simple_txt(tgt_v_path)
+        #print(self.tgt_tris)
 
         self.tgt_vert_pos = []
         self.tgt_vert_geo = []
@@ -36,7 +38,7 @@ class PrepDataloader(Dataset):
         src_bvh_paths = Path(f"./dataset/Animations/bvhs/{src_name}")
         src_bvh_files = list(src_bvh_paths.glob("*.bvh"))
         tgt_bvh_file = list(Path(f"./dataset/Animations/bvhs/{tgt_name}").glob("*.bvh"))[0]
-        print("tgt_bvh_file: ", tgt_bvh_file)
+        print("target character geo file: ", tgt_bvh_file)
         
          # BVH 파일들을 순회하며 데이터 로드
         first_file = True
@@ -45,7 +47,7 @@ class PrepDataloader(Dataset):
                 # 첫 번째 파일에서 관절 구조 정보 초기화
                 self._initialize_joint_structure(bvh_file)
                 first_file = False
-
+            print("target motion sequence: ", bvh_file)
             self.motion_sequences.append(self._process_bvh_file(bvh_file))   
 
         self._initialize_joint_structure(tgt_bvh_file)
@@ -55,7 +57,7 @@ class PrepDataloader(Dataset):
         첫 번째 BVH 파일을 기반으로 관절 구조 초기화
         """
         
-        print("bvh_path = ", bvh_path)
+        print("bvh_path for joint initialization = ", bvh_path)
         parser = BVHParser()
         parser.parse_bvh(bvh_path)
         
@@ -126,7 +128,7 @@ class PrepDataloader(Dataset):
     def __len__(self) -> int:
         return len(self.motion_sequences)
 
-    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, dict, np.ndarray, np.ndarray]:
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, dict, np.ndarray, np.ndarray, np.ndarray]:
         """
         데이터셋의 단일 항목 반환
         
@@ -141,12 +143,17 @@ class PrepDataloader(Dataset):
         """
 
         #TODO: 버텍스 정보 반환하도록 변경, PointNet 임베딩 같이 반환하도록 구현
+        tris = []
+        for tri in self.tgt_tris:
+            tris.append(tri['indices'])
+
         return (
             self.motion_sequences[idx],
             np.array(self.tgt_vert_pos),
             self.tgt_vert_geo,
             None,
-            np.array(self.joint_offsets_list)
+            np.array(self.joint_offsets_list),
+            np.array(tris)
         )
 
 def create_dataloader(
@@ -154,7 +161,7 @@ def create_dataloader(
     tgt_name,
     batch_size: int = 32,
     shuffle: bool = True
-) -> Tuple[PrepDataloader, Dict[str, int]]:
+) -> Tuple[PrepDataloader, list]:
     """
     모션 데이터 로더 생성
     
@@ -167,4 +174,4 @@ def create_dataloader(
         DataLoader 객체
     """
     dataset = PrepDataloader(src_name,tgt_name)
-    return dataset, dataset.joint_name_to_idx
+    return dataset, dataset.joint_parents_list
