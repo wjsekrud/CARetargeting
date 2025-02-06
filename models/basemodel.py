@@ -5,14 +5,15 @@ import sys
 sys.path.append("./")
 from utils.LBS import convert_weights_to_sparse
 from utils.FKlayer import compute_bone_positions
-from utils.bvhexporter import save_animation_to_bvh
-
+from utils.bvhexporter import save
+from aPyOpenGL.transforms.numpy import quat
 class BaseModel(nn.Module):
     def __init__(self, 
                  input_size, 
                  target_vertex, 
                  target_skel, 
                  target_geo,
+                 target_aPy_skel,
                  geo_embedding_size, 
                  geo_embedding, 
                  target_tris,
@@ -32,11 +33,13 @@ class BaseModel(nn.Module):
         self.global_positions = torch.zeros(66)
         self.vertex_positions = None
         self.target_geo = target_geo
-        self.target_skeleton = target_skel #[22,3]
+        self.target_skeleton_offset = target_skel #[22,3]
         self.target_geo_embedding = geo_embedding
         self.ref_vertices = target_vertex
         self.ref_tris = target_tris
-        self.target_geo_sps = convert_weights_to_sparse(target_geo,len(self.ref_vertices),len(self.target_skeleton))
+        #self.target_geo_sps = convert_weights_to_sparse(target_geo,len(self.ref_vertices),len(self.target_skeleton))
+
+        self.tgt_aPy_skel = target_aPy_skel
 
         self.clip = []
         self.jclip = []
@@ -64,10 +67,10 @@ class BaseModel(nn.Module):
 
     def changeconfig(self, target_vertex, target_skel, target_geometry, geo_embedding):
         self.ref_vertices = target_vertex
-        self.target_skeleton = target_skel
+        self.target_skeleton_offset = target_skel
         self.target_geo = target_geometry
         self.target_geo_embedding = geo_embedding
-        self.target_geo_sps = convert_weights_to_sparse(self.target_geo,len(self.ref_vertices),len(self.target_skeleton))
+        #self.target_geo_sps = convert_weights_to_sparse(self.target_geo,len(self.ref_vertices),len(self.target_skeleton))
         
         
     def encode(self, rotation, velocity):
@@ -95,7 +98,7 @@ class BaseModel(nn.Module):
         decoder_input = torch.cat([
             self.prev_joint_positions.flatten(),
             self.prev_root_velocity,
-            torch.tensor(self.target_skeleton.flatten(), dtype=torch.float32),
+            torch.tensor(self.target_skeleton_offset.flatten(), dtype=torch.float32),
             self.target_geo_embedding,
             self.h_enc.flatten(),
         ], dim=0).unsqueeze(0).unsqueeze(0)  # (batch_size, 1, decoder_input_size)
@@ -139,19 +142,29 @@ class BaseModel(nn.Module):
     
     def testfoward(self, rotation, velocity):
 
-        joint_positions = compute_bone_positions(rotation, self.target_skeleton, self.parent_list )
-        vertex_positions = self.skinning_layer(self.target_geo, joint_positions, self.ref_vertices)
+        #joint_positions = compute_bone_positions(rotation, self.target_skeleton, self.parent_list )
+        #
+        #
+        joint_quat, joint_pos = quat.fk(rotation, self.target_skeleton_offset[0], self.tgt_aPy_skel)
+        #joint_pos, joint_rot = compute_bone_positions(rotation, self.target_skeleton, self.parent_list, self.tgt_aPy_skel.v_up)
+        vertex_positions = self.skinning_layer(self.target_geo, self.target_skeleton_offset, self.ref_vertices)
 
         self.clip.append(vertex_positions)
-        self.jclip.append(rotation)
+        self.euler = []
+        print(type(vertex_positions))
+        for quats in joint_quat:
+            self.euler.append(quat.quaternion_to_euler(quats))
+        self.jclip.append(self.euler)
         #print(len(self.jclip),len(self.jclip[-1]))
         #print(self.jclip)
     
     
     def saveanim(self):
         save_to_obj(self.clip[0], self.ref_tris)
-        save_animation_to_bvh("C:/Users/vml/Documents/GitHub/CARetargeting/models/output.bvh",
-                              np.array(self.jclip), self.parent_list ,self.target_skeleton)
+        save("C:/Users/vml/Documents/GitHub/CARetargeting/models/output.bvh", 
+             self.jclip, self.clip, self.target_skeleton_offset, self.parent_list)
+        #save_animation_to_bvh("C:/Users/vml/Documents/GitHub/CARetargeting/models/output.bvh",
+        #                      np.array(self.jclip), self.parent_list ,self.target_skeleton)
         print("done saveanim")
         
     
@@ -173,18 +186,19 @@ class BaseModel(nn.Module):
             blended_position = np.zeros(3)
             
             # 각 영향받는 본에 대해 가중치를 적용하여 위치 계산
-            for bone_info in weights_info:
-                bone_idx = bone_info['bone_index']
-                weight = bone_info['weight']
+            for jidx in range(22):
+                weight = weights_info[jidx]
+                if weight > 0:
+                    # 본 오프셋을 이용한 변환 계산
+                    bone_offset = bone_transforms[jidx]
+                    
+                    # 본 변환 행렬 계산 (여기서는 간단한 이동 변환만 적용)
+                    transformed_position = vertex_pos + bone_offset
+                    
+                    # 가중치를 적용하여 최종 위치에 더함
+                    blended_position += weight * transformed_position
                 
-                # 본 오프셋을 이용한 변환 계산
-                bone_offset = bone_transforms[bone_idx]
                 
-                # 본 변환 행렬 계산 (여기서는 간단한 이동 변환만 적용)
-                transformed_position = vertex_pos + bone_offset
-                
-                # 가중치를 적용하여 최종 위치에 더함
-                blended_position += weight * transformed_position
                 
             skinned_vertices[vertex_idx] = blended_position
             

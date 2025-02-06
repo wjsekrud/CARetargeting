@@ -7,6 +7,15 @@ def convert_weights_to_sparse(weight_data, num_vertices, num_bones):
     cols = []
     data = []
     
+    for vidx in range(len(weight_data)):
+        for jidx in range(22):
+            rows.append(vidx)
+            if weight_data[jidx] != 0:
+                cols.append(jidx)
+                data.append(weight_data[jidx])
+
+            
+
     for vertex_idx, bone_weights in enumerate(weight_data):
         for weight_info in bone_weights:
             rows.append(vertex_idx)

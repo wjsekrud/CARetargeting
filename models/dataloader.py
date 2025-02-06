@@ -11,17 +11,18 @@ import sys
 sys.path.append("./")
 from utils.NewVertex import load_from_simple_txt 
 from utils.LBS import convert_weights_to_sparse
-from utils.bvhparser import BVHParser
-
+from utils.bvhparser import BVHParser ###
+from aPyOpenGL.agl.bvh import BVH
 
 class PrepDataloader(Dataset):
     def __init__(self, src_name, tgt_name):
 
         self.motion_sequences = []
-        # 관절 이름과 인덱스 매핑 생성
-        self.joint_name_to_idx = {}
-        self.joint_parents_list = []
-        self.joint_offsets_list = []
+        # 관절 이름과 인덱스 매핑
+        #self.joint_name_to_idx = {}
+
+        #self.joint_parents_list = []
+        #self.joint_offsets_list = []
 
         src_v_path = Path(f"./dataset/vertexes/{src_name}_clean_vertices.txt")
         tgt_v_path = Path(f"./dataset/vertexes/{tgt_name}_clean_vertices.txt")
@@ -29,59 +30,39 @@ class PrepDataloader(Dataset):
         self.tgt_vertices, self.tgt_tris, self.tgt_h = load_from_simple_txt(tgt_v_path)
         #print(self.tgt_tris)
 
-        self.tgt_vert_pos = []
-        self.tgt_vert_geo = []
-        for verts in self.tgt_vertices:
-            self.tgt_vert_pos.append(verts.position)
-            self.tgt_vert_geo.append(verts.bone_weights)
+        #==========================================================\
+        self.tgt_vert_pos = np.zeros((len(self.src_vertices), 3))
+        self.tgt_vert_geo = np.zeros((len(self.tgt_vertices), 22))
+        for i in range(len(self.tgt_vert_pos)):
+            self.tgt_vert_pos[i] = self.src_vertices[i].position
+            for weight in self.src_vertices[i].bone_weights:
+                self.tgt_vert_geo[i][weight['bone_index']] = weight['weight'] # numpy 배열로 geometry 저장 [V, J]
+        #==========================================================/
 
         src_bvh_paths = Path(f"./dataset/Animations/bvhs/{src_name}")
         src_bvh_files = list(src_bvh_paths.glob("*.bvh"))
-        tgt_bvh_file = list(Path(f"./dataset/Animations/bvhs/{tgt_name}").glob("*.bvh"))[0]
+        tgt_bvh_file = list(Path(f"./dataset/Animations/bvhs/{tgt_name}").glob("*.bvh"))[0] #character file
         print("target character geo file: ", tgt_bvh_file)
         
-         # BVH 파일들을 순회하며 데이터 로드
-        first_file = True
-        for bvh_file in src_bvh_files:
-            if first_file:
-                # 첫 번째 파일에서 관절 구조 정보 초기화
-                self._initialize_joint_structure(bvh_file)
-                first_file = False
-            print("target motion sequence: ", bvh_file)
-            self.motion_sequences.append(self._process_bvh_file(bvh_file))   
+        #==========================================================\
+        self.tgtchar_skel = BVH(str(tgt_bvh_file)).poses[0].skeleton
+        tgtchar = self.tgtchar_skel.joints
+        self.tgt_joint_offset = np.zeros((len(tgtchar),3), dtype=np.float32)
+        self.tgt_joint_localrot = np.zeros((len(tgtchar),4), dtype=np.float32)
+        self.joint_parents_list = self.tgtchar_skel.parent_idx
 
-        self._initialize_joint_structure(tgt_bvh_file)
-    
-    def _initialize_joint_structure(self, bvh_path: str):
-        """
-        첫 번째 BVH 파일을 기반으로 관절 구조 초기화
-        """
-        
-        print("bvh_path for joint initialization = ", bvh_path)
-        parser = BVHParser()
-        parser.parse_bvh(bvh_path)
-        
-        # 관절 이름과 인덱스 매핑 생성
-        for idx, joint_name in enumerate(parser.joint_channels.keys()):
-            self.joint_name_to_idx[joint_name] = idx
-            #print(idx, joint_name, self.joint_name_to_idx[joint_name])
-        
-        # 부모 관절 정보를 리스트로 변환
-        num_joints = len(self.joint_name_to_idx)
-        self.joint_parents_list = [-1] * num_joints  # -1은 부모가 없음을 의미
-        
-        for joint_name, parent_name in parser.joint_parents.items():
-            if joint_name[-3:] not in ["JOINT", "End", "ROOT"]:
-                joint_idx = self.joint_name_to_idx[joint_name]
-                parent_idx = self.joint_name_to_idx[parent_name]
-            self.joint_parents_list[joint_idx] = parent_idx
-        
-        # 오프셋 정보를 리스트로 변환
-        self.joint_offsets_list = [None] * num_joints
-        for joint_name, offset in parser.joint_offsets.items():
-            if joint_name[-3:] not in ["JOINT", "End", "ROOT"]:
-                joint_idx = self.joint_name_to_idx[joint_name]
-                self.joint_offsets_list[joint_idx] = offset
+        for i in range(len(tgtchar)):
+            self.tgt_joint_offset[i] = tgtchar[i].local_pos
+
+        # BVH 파일들을 순회하며 데이터 로드
+        for bvh_file in src_bvh_files:
+            
+            newpose = BVH(str(bvh_file)).poses
+            self.motion_sequences.append(newpose)
+            #self.motion_sequences.append(self._process_bvh_file(bvh_file))   ###
+         #==========================================================/
+        #self._initialize_joint_structure(tgt_bvh_file)
+
 
     '''
     def parsebvh(self, file):
@@ -89,7 +70,7 @@ class PrepDataloader(Dataset):
         joint_rotations = self.parser.get_joint_rotations() # J : [F : 3]
         root_velocities = self.parser.get_root_velocity() # [F : 3]
         return joint_rotations, root_velocities
-    #'''
+    #''
 
     def _process_bvh_file(self, bvh_path: str):
         """
@@ -124,7 +105,8 @@ class PrepDataloader(Dataset):
             sequences.append(sequence_data)
 
         return sequences
-    
+    #'''
+
     def __len__(self) -> int:
         return len(self.motion_sequences)
 
@@ -149,10 +131,11 @@ class PrepDataloader(Dataset):
 
         return (
             self.motion_sequences[idx],
-            np.array(self.tgt_vert_pos),
+            self.tgt_vert_pos,
             self.tgt_vert_geo,
             None,
-            np.array(self.joint_offsets_list),
+            np.array(self.tgt_joint_offset),
+            self.tgtchar_skel,
             np.array(tris)
         )
 
