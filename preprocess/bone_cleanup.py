@@ -83,14 +83,14 @@ def transfer_weights_to_parent(armature, bone_name, keep_bones):
             for idx, weight in zip(vertex_indices_to_update, weights_to_update):
                 parent_group.add([idx], weight, 'ADD')
 
-def cleanup_armature(fbx_path, bones_list_path, output_path):
+def cleanup_armature(fbx_path, bones_list_path, output_path, import_scale=1.0, export_scale=0.01):
     """메인 처리 함수"""
     # 기존 씬 초기화
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete()
     
     # FBX 파일 임포트
-    bpy.ops.import_scene.fbx(filepath=fbx_path)
+    bpy.ops.import_scene.fbx(filepath=fbx_path, global_scale=import_scale)
     
     # 아마추어 찾기
     armature = None
@@ -185,7 +185,8 @@ def cleanup_armature(fbx_path, bones_list_path, output_path):
         use_selection=False,
         use_armature_deform_only=True,
         add_leaf_bones=False,
-        bake_anim=True
+        bake_anim=True,
+        global_scale=export_scale
     )
     
 # 스크립트 실행 예시

@@ -75,7 +75,7 @@ class BVH:
                 chanmatch = re.match(r"\s*CHANNELS\s+(\d+)", line)
                 if chanmatch:
                     channels = int(chanmatch.group(1))
-                    print(channels)
+                    #print(channels)
                     channelis = 0 if channels == 3 else 3
                     channelie = 3 if channels == 3 else 6
                     parts = line.split()[2 + channelis:2 + channelie]

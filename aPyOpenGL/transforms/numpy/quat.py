@@ -6,11 +6,6 @@ from . import rotmat, aaxis, euler, ortho6d, xform
 Quaternion operations
 """
 def quaternion_to_euler(q):
-    """
-    Quaternion을 Euler angles (roll, pitch, yaw)로 변환합니다.
-    입력 quaternion은 [w, x, y, z] 형식입니다.
-    반환값은 라디안 단위의 [roll, pitch, yaw] 입니다.
-    """
     # Quaternion 성분 추출
     w, x, y, z = q
     

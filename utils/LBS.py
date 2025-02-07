@@ -1,85 +1,173 @@
+import os
+import torch
 import numpy as np
-from scipy import sparse
 
-def convert_weights_to_sparse(weight_data, num_vertices, num_bones):
-    """딕셔너리 형태의 가중치 데이터를 희소 행렬로 변환"""
-    rows = []
-    cols = []
-    data = []
+from OpenGL.GL import * 
+from aPyOpenGL.transforms import torch as trf_t
+
+def linear_blend_skinning(pre_xforms, parents, root_pos, bone_offset, quats, rest_verts_pos, skin_weights):
+    '''
+        pre_xforms       (J, 4, 4)
+        parents          (J, )
+        root pos         (3,)
+        bone_offset      (J, 3)
+        quats            (T, J, 4)
+        rest_verts_pos   (num_vertices, 3), initial vertex positions
+        skin_weights     (num_vertices, J)
+    '''
+    # T, J, num_of_verts 정의 
+    T = quats.shape[0]
+    J = bone_offset.shape[0]  # J
+    nov = rest_verts_pos.shape[0]
     
-    for vidx in range(len(weight_data)):
-        for jidx in range(22):
-            rows.append(vidx)
-            if weight_data[jidx] != 0:
-                cols.append(jidx)
-                data.append(weight_data[jidx])
+    # pre-xforms 적용
+    pre_xforms_cl = pre_xforms.clone()      # (J, 4, 4)
+    print(pre_xforms)
+    pre_quats  = trf_t.xform.to_quat(pre_xforms_cl)                                    # (J, 4)
 
-            
+    ids = trf_t.quat.identity()[None].repeat(J, 1).cuda(quats.device)  # (1, 4) -> (J, 4)
+    ids = trf_t.quat.mul(pre_quats[:, :], ids)                         # (J, 4)
+    quats = trf_t.quat.mul(pre_quats.repeat(T, 1, 1), quats)           # (T, J, 4)
+                
+    # 4 x 4 transformation matrix (R: identity / T: bone offsets)
+    rest_mat = trf_t.quat.to_rotmat(ids)                                            # (J, 3, 3)
+    rest_mat = torch.cat([rest_mat, bone_offset.unsqueeze(-1),], dim=-1)           # (J, 3, 4)
+    rest_mat = torch.cat([rest_mat, torch.tensor([0, 0, 0, 1], dtype=torch.float).repeat(J, 1, 1).cuda(quats.device),], dim=-2,)  # (J, 4, 4) = (J, 3, 4) + (J, 1, 4)
 
-    for vertex_idx, bone_weights in enumerate(weight_data):
-        for weight_info in bone_weights:
-            rows.append(vertex_idx)
-            cols.append(weight_info['bone_index'])
-            data.append(weight_info['weight'])
+    # 4 x 4 transformation matrix (R: current rot / T: bone offsets) 
+    rot_mat = trf_t.quat.to_rotmat(quats)                                                                                                                        # (T, J, 3, 3)
+    rot_mat = torch.cat([rot_mat, bone_offset[None, :, :, None].repeat(T, 1, 1, 1)], dim=-1)                                                       # (T, J, 3, 4) = (T, J, 3, 3) + (T, J, 3, 1)
+    rot_mat = torch.cat([rot_mat, torch.tensor([0, 0, 0, 1], dtype=torch.float).repeat(T, J, 1, 1).cuda(quats.device),], dim=-2,)  # (T, J, 4, 4) = (T, J, 3, 4) + (T, J, 1, 4)
+
+    # matrix들 복사 후 조인트 별로 잘라서 리스트 형태로 만들기 
+    rest_local_trf     = rest_mat.clone()                              # (J, 4, 4)
+    rot_local_trf      = rot_mat.clone()                               # (T, J, 4, 4)
+    rest_local_trf_lst = list(torch.split(rest_local_trf, 1, dim=0))   # len(): J(=22), 각 요소는 (1, 4, 4)
+    rot_local_trf_lst  = list(torch.split(rot_local_trf,  1, dim=1))   # len(): J(=22), 각 요소는 (T, 1, 4, 4)
     
-    return sparse.csr_matrix((data, (rows, cols)), 
-                           shape=(num_vertices, num_bones))
+    # world coordinate 기준으로 변경 (Glob_child = Glob_parent x Local_child)
+    rest_glob_trf_lst, rot_glob_trf_lst = [rest_local_trf_lst[0]], [rot_local_trf_lst[0]]
+    for i in range(1, J):
+        rest_glob_trf_lst.append(torch.matmul(rest_glob_trf_lst[parents[i]][:, :, :], rest_local_trf_lst[i][:, :, :]))  # (1, 4, 4) x (1, 4, 4) -> len(): J(=22), 각 요소는 (1, 4, 4)
+        rot_glob_trf_lst.append(torch.matmul(rot_glob_trf_lst[parents[i]][:, :, :], rot_local_trf_lst[i][:, :, :]))
+                           
+    rest_glob_trf = torch.cat(rest_glob_trf_lst, dim=0)     # (J, 4, 4)
+    rot_glob_trf  = torch.cat(rot_glob_trf_lst, dim=1)      # (T, J, 4, 4)
 
-def compute_skinned_vertices_fast(weight_matrix, bone_transforms, vertices):
-    """
-    최적화된 LBS 구현
+    # rest pose에서 현재 포즈로의 변환 행렬 
+    rest_glob_trf_inv = rest_glob_trf.inverse().repeat(T, 1, 1, 1)                          # (J, 4, 4) -> (T, J, 4, 4)
+    rest_to_rot_trf   = torch.einsum('tjmn,tjnk->tjmk', rot_glob_trf, rest_glob_trf_inv)    # (T, J, 4, 4)
+
+    # rest-pose일 때의 vertex position 
+    verts_rest = torch.cat([rest_verts_pos, torch.ones((nov, 1), dtype=torch.float).cuda(quats.device),], dim=-1,)   # (num_verts, 3) -> (num_verts, 4)
     
-    Args:
-        weight_matrix: scipy.sparse.csr_matrix - 버텍스-본 가중치 행렬 (N x B)
-        bone_transforms: numpy.ndarray - 본 변환 행렬들 (B x 3)
-        vertices: numpy.ndarray - 원본 버텍스 위치 (N x 3)
+    # skinning weight 적용하여 새로운 vertex position 구하기 
+    verts_lbs = torch.zeros((T, nov, 4)).cuda(quats.device)                     
+    for t in range(T):
+        for j in range(J):
+            print(skin_weights[:,j].shape)
+            weight = skin_weights[:, j].unsqueeze(1)                                          # (num_verts, 1)
+            tfs = rest_to_rot_trf[t, j, :, :]                                                       # (4，4)            
+            verts_lbs[t, :, :] += weight * tfs.matmul(verts_rest.transpose(0, 1)).transpose(0, 1)   # (4, 4) x (4, num_verts) = (4, num_verts) -> (num_verts, 4)
+
+    # root 복원 
+    root_recover_trf = trf_t.quat.to_rotmat(trf_t.quat.identity()).cuda(quats.device)   # (3, 3)                            
+    root_recover_trf = torch.cat([root_recover_trf, (root_pos).unsqueeze(-1)], dim=-1)      # (3, 4)
+    root_recover_trf = torch.cat([root_recover_trf, torch.tensor([0, 0, 0, 1], dtype=torch.float)[None].cuda(quats.device),], dim=0)    # (4, 4)
+
+    verts_lbs_root_recover = torch.zeros((verts_lbs.shape)).cuda(quats.device)
+    for t in range(T):
+        # (R: identity / T: current global root position)
+        cur_root_pos_trf = rot_glob_trf[t, 0, :3, 3]    # (3,)
+        cur_root_pos_trf = torch.cat([trf_t.quat.to_rotmat(trf_t.quat.identity()).cuda(quats.device), cur_root_pos_trf.unsqueeze(-1)], dim=-1)
+        cur_root_pos_trf = torch.cat([cur_root_pos_trf, torch.tensor([0, 0, 0, 1], dtype=torch.float)[None].cuda(quats.device)], dim=0)
         
-    Returns:
-        numpy.ndarray - 스키닝된 버텍스 위치 (N x 3)
-    """
-    # 각 본의 변환을 적용한 버텍스 위치 계산 (브로드캐스팅 사용)
-    transformed_positions = vertices[:, np.newaxis, :] + bone_transforms[np.newaxis, :, :]
-    
-    # 변환된 위치를 (N, B, 3) 형태로 재구성
-    transformed_positions = transformed_positions.reshape(-1, bone_transforms.shape[0], 3)
-    
-    # 가중치 행렬과 변환된 위치를 곱하여 최종 위치 계산
-    # weight_matrix: (N x B), transformed_positions: (N x B x 3)
-    skinned_positions = np.zeros_like(vertices)
-    
-    for i in range(3):  # x, y, z 각 좌표에 대해
-        skinned_positions[:, i] = weight_matrix.dot(transformed_positions[:, :, i])
-    
-    return skinned_positions
+        root_recovered_trf = torch.matmul(root_recover_trf, cur_root_pos_trf.inverse())
+        
+        verts_lbs_root_recover[t, :, :] = root_recovered_trf.matmul(verts_lbs[t, :, :].transpose(0, 1)).transpose(0, 1)
 
-def example_usage_fast():
-    # 테스트 데이터
-    num_vertices = 1000
-    num_bones = 22
-    
-    # 원본 가중치 데이터 (희소 형태)
-    weight_data = [
-        [{'idx': i % num_bones, 'weight': 0.7}, 
-         {'idx': (i + 1) % num_bones, 'weight': 0.3}]
-        for i in range(num_vertices)
-    ]
-    
-    # 테스트용 데이터 생성
-    vertices = np.random.rand(num_vertices, 3)
-    bone_transforms = np.random.rand(num_bones, 3)
-    
-    # 가중치 데이터를 희소 행렬로 변환
-    weight_matrix = convert_weights_to_sparse(weight_data, num_vertices, num_bones)
-    
-    # 스키닝 계산
-    import time
-    start_time = time.time()
-    
-    result = compute_skinned_vertices_fast(weight_matrix, bone_transforms, vertices)
-    
-    end_time = time.time()
-    print(f"Processing time: {(end_time - start_time) * 1000:.2f}ms")
-    print(f"Result shape: {result.shape}")
+    verts_lbs_root_recover = verts_lbs_root_recover[:, :, :3]   # (T, num_verts, 4) -> (T, num_verts, 3)
 
-if __name__ == "__main__":
-    example_usage_fast()
+    return verts_lbs_root_recover
+
+def linear_blend_skinning_2(selected_skel, parents, root_pos, bone_offset, quats, rest_verts_pos, skin_weights):
+    '''
+        root pos         (3,)
+        bone_offset      (J, 3), 원점에서 시작하는 시퀀스의 glob root pos + t-pose 일 때의 bone offsets
+        quats            (T, J, 4)
+        rest_verts_pos   (num_vertices, 3), initial vertex positions
+        skin_weights     (num_vertices, J)
+    '''
+    # T, J, num_of_verts 정의 
+    T = quats.shape[0]
+    J = bone_offset.shape[0]  # J
+    nov = rest_verts_pos.shape[0]
+    
+    # pre-xforms 적용
+    pre_xforms = torch.from_numpy(selected_skel.pre_xforms).cuda(quats.device)      # (J, 4, 4)
+    pre_quats  = trf_t.xform.to_quat(pre_xforms)                                    # (J, 4)
+
+    ids = trf_t.quat.identity()[None].repeat(J, 1).cuda(quats.device)  # (1, 4) -> (J, 4)
+    ids = trf_t.quat.mul(pre_quats[:, :], ids)                         # (J, 4)
+    quats = trf_t.quat.mul(pre_quats.repeat(T, 1, 1), quats)           # (T, J, 4)
+                
+    # 4 x 4 transformation matrix (R: identity / T: bone offsets)
+    rest_mat = trf_t.quat.to_rotmat(ids)                                            # (J, 3, 3)
+    rest_mat = torch.cat([rest_mat, bone_offset.unsqueeze(-1),], dim=-1)           # (J, 3, 4)
+    rest_mat = torch.cat([rest_mat, torch.tensor([0, 0, 0, 1], dtype=torch.float).repeat(J, 1, 1).cuda(quats.device),], dim=-2,)  # (J, 4, 4) = (J, 3, 4) + (J, 1, 4)
+
+    # 4 x 4 transformation matrix (R: current rot / T: bone offsets) 
+    rot_mat = trf_t.quat.to_rotmat(quats)                                                                                                                        # (T, J, 3, 3)
+    rot_mat = torch.cat([rot_mat, bone_offset[None, :, :, None].repeat(T, 1, 1, 1)], dim=-1)                                                       # (T, J, 3, 4) = (T, J, 3, 3) + (T, J, 3, 1)
+    rot_mat = torch.cat([rot_mat, torch.tensor([0, 0, 0, 1], dtype=torch.float).repeat(T, J, 1, 1).cuda(quats.device),], dim=-2,)  # (T, J, 4, 4) = (T, J, 3, 4) + (T, J, 1, 4)
+
+    # matrix들 복사 후 조인트 별로 잘라서 리스트 형태로 만들기 
+    rest_local_trf     = rest_mat.clone()                              # (J, 4, 4)
+    rot_local_trf      = rot_mat.clone()                               # (T, J, 4, 4)
+    rest_local_trf_lst = list(torch.split(rest_local_trf, 1, dim=0))   # len(): J(=22), 각 요소는 (1, 4, 4)
+    rot_local_trf_lst  = list(torch.split(rot_local_trf,  1, dim=1))   # len(): J(=22), 각 요소는 (T, 1, 4, 4)
+    
+    # world coordinate 기준으로 변경 (Glob_child = Glob_parent x Local_child)
+    rest_glob_trf_lst, rot_glob_trf_lst = [rest_local_trf_lst[0]], [rot_local_trf_lst[0]]
+    for i in range(1, J):
+        rest_glob_trf_lst.append(torch.matmul(rest_glob_trf_lst[parents[i]][:, :, :], rest_local_trf_lst[i][:, :, :]))  # (1, 4, 4) x (1, 4, 4) -> len(): J(=22), 각 요소는 (1, 4, 4)
+        rot_glob_trf_lst.append(torch.matmul(rot_glob_trf_lst[parents[i]][:, :, :], rot_local_trf_lst[i][:, :, :]))
+                           
+    rest_glob_trf = torch.cat(rest_glob_trf_lst, dim=0)     # (J, 4, 4)
+    rot_glob_trf  = torch.cat(rot_glob_trf_lst, dim=1)      # (T, J, 4, 4)
+
+    # rest pose에서 현재 포즈로의 변환 행렬 
+    rest_glob_trf_inv = rest_glob_trf.inverse().repeat(T, 1, 1, 1)                          # (J, 4, 4) -> (T, J, 4, 4)
+    rest_to_rot_trf   = torch.einsum('tjmn,tjnk->tjmk', rot_glob_trf, rest_glob_trf_inv)    # (T, J, 4, 4)
+
+    # rest-pose일 때의 vertex position 
+    verts_rest = torch.cat([rest_verts_pos, torch.ones((nov, 1), dtype=torch.float).cuda(quats.device),], dim=-1,)   # (num_verts, 3) -> (num_verts, 4)
+    
+    # skinning weight 적용하여 새로운 vertex position 구하기 
+    verts_lbs = torch.zeros((T, nov, 4)).cuda(quats.device)                     
+    for t in range(T):
+        for j in range(J):
+            weight = skin_weights[:, j].unsqueeze(1)                                                # (num_verts, 1)
+            tfs = rest_to_rot_trf[t, j, :, :]                                                       # (4，4)            
+            verts_lbs[t, :, :] += weight * tfs.matmul(verts_rest.transpose(0, 1)).transpose(0, 1)   # (4, 4) x (4, num_verts) = (4, num_verts) -> (num_verts, 4)
+
+    # root 복원 
+    root_pos = torch.from_numpy(root_pos).cuda(quats.device)
+    root_recover_trf = trf_t.quat.to_rotmat(trf_t.quat.identity()).cuda(quats.device)   # (3, 3)                            
+    root_recover_trf = torch.cat([root_recover_trf, (root_pos).unsqueeze(-1)], dim=-1)      # (3, 4)
+    root_recover_trf = torch.cat([root_recover_trf, torch.tensor([0, 0, 0, 1], dtype=torch.float)[None].cuda(quats.device),], dim=0)    # (4, 4)
+
+    verts_lbs_root_recover = torch.zeros((verts_lbs.shape)).cuda(quats.device)
+    for t in range(T):
+        # (R: identity / T: current global root position)
+        cur_root_pos_trf = rot_glob_trf[t, 0, :3, 3]    # (3,)
+        cur_root_pos_trf = torch.cat([trf_t.quat.to_rotmat(trf_t.quat.identity()).cuda(quats.device), cur_root_pos_trf.unsqueeze(-1)], dim=-1)
+        cur_root_pos_trf = torch.cat([cur_root_pos_trf, torch.tensor([0, 0, 0, 1], dtype=torch.float)[None].cuda(quats.device)], dim=0)
+        
+        root_recovered_trf = torch.matmul(root_recover_trf, cur_root_pos_trf.inverse())
+        
+        verts_lbs_root_recover[t, :, :] = root_recovered_trf.matmul(verts_lbs[t, :, :].transpose(0, 1)).transpose(0, 1)
+
+    verts_lbs_root_recover = verts_lbs_root_recover[:, :, :3]   # (T, num_verts, 4) -> (T, num_verts, 3)
+
+    return verts_lbs_root_recover

@@ -3,21 +3,24 @@ import torch.nn as nn
 import numpy as np
 import sys
 sys.path.append("./")
-from utils.LBS import convert_weights_to_sparse
-from utils.FKlayer import compute_bone_positions
 from utils.bvhexporter import save
 from aPyOpenGL.transforms.numpy import quat
+from aPyOpenGL.agl.motion import Skeleton
+from aPyOpenGL.agl.motion import Motion
+from utils.LBS import linear_blend_skinning, linear_blend_skinning_2
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(torch.cuda.is_available())
+
 class BaseModel(nn.Module):
     def __init__(self, 
                  input_size, 
-                 target_vertex, 
-                 target_skel, 
-                 target_geo,
+                 target_vpos, #버텍스 위치
+                 target_skinning, # 스키닝 리스트
+                 geo_embedding, # 스키닝 임베딩
+                 target_offsets, # 본 오프셋 리스트
                  target_aPy_skel,
-                 geo_embedding_size, 
-                 geo_embedding, 
-                 target_tris,
-                 parent_list,
+                 target_tris, # 폴리곤 인덱스
+                 geo_embedding_size=64, # 스키닝 임베딩 사이즈
                  enc_hidden_size=512, 
                  dec_hidden_size=512, 
                  joint_positions_size=22*3, 
@@ -25,35 +28,24 @@ class BaseModel(nn.Module):
                  root_velocity_size=3):
         super(BaseModel, self).__init__()
         
-        # State for maintaining temporal information
         self.h_enc = torch.zeros(2,1,enc_hidden_size)  # Encoder hidden state
         self.h_dec = torch.zeros(2,1,dec_hidden_size)  # Decoder hidden state
         self.prev_joint_positions = torch.zeros(66)
         self.prev_root_velocity = torch.zeros(3)
         self.global_positions = torch.zeros(66)
-        self.vertex_positions = None
-        self.target_geo = target_geo
-        self.target_skeleton_offset = target_skel #[22,3]
-        self.target_geo_embedding = geo_embedding
-        self.ref_vertices = target_vertex
-        self.ref_tris = target_tris
-        #self.target_geo_sps = convert_weights_to_sparse(target_geo,len(self.ref_vertices),len(self.target_skeleton))
+        self.skeleton = Skeleton()
 
-        self.tgt_aPy_skel = target_aPy_skel
+        self.setupmesh(target_vpos, target_skinning, geo_embedding, target_offsets, target_aPy_skel, target_tris)
 
-        self.clip = []
-        self.jclip = []
-        self.parent_list = parent_list
-        # 인코더 GRU
+        self.clip, self.jclip = [], []
+  
         self.encoder_gru = nn.GRU(
             input_size=input_size,  # 입력: [θᴬ, ωᴬ] (소스 캐릭터의 관절 각도와 각속도)
             hidden_size=enc_hidden_size,
             num_layers=2,
             batch_first=True
         )
-        print("encodersize", self.encoder_gru.input_size)
         
-        # 디코더 GRU
         # 디코더 입력 크기: encoder 히든 스테이트 + 조인트 포지션 + 루트 속도 + 스키닝 임베딩, 조인트 configuration
         self.decoder_gru = nn.GRU(
             input_size=enc_hidden_size*2 + joint_positions_size + root_velocity_size + geo_embedding_size + joint_config_size,
@@ -65,14 +57,18 @@ class BaseModel(nn.Module):
         self.rotation_layer = nn.Linear(dec_hidden_size, 66)
         self.velocity_layer = nn.Linear(dec_hidden_size, 3)
 
-    def changeconfig(self, target_vertex, target_skel, target_geometry, geo_embedding):
-        self.ref_vertices = target_vertex
-        self.target_skeleton_offset = target_skel
-        self.target_geo = target_geometry
-        self.target_geo_embedding = geo_embedding
-        #self.target_geo_sps = convert_weights_to_sparse(self.target_geo,len(self.ref_vertices),len(self.target_skeleton))
-        
-        
+    def setupmesh(self, vpos, vskin, vskine, joint_offsets, Skeleton, tris):
+        self.ref_vpos = vpos
+        self.target_skinning = vskin,
+        self.target_skinning = self.target_skinning[0]
+        self.target_geo_embedding = vskine,
+        self.target_geo_embedding = self.target_geo_embedding[0]
+        self.target_joint_offset = joint_offsets,
+        self.target_joint_offset = self.target_joint_offset[0]
+        self.skeleton = Skeleton,
+        self.skeleton = self.skeleton[0]
+        self.ref_tris = tris
+
     def encode(self, rotation, velocity):
         """
         source_motion: [Time, Joint idx, 3] + [Time, Joint len + 1, 3]
@@ -92,13 +88,10 @@ class BaseModel(nn.Module):
         target_skeleton_embedding: PointNet으로 생성된 타깃 스켈레톤 임베딩
         """
 
-        # 초기 디코더 입력 준비
-        #motion = np.concatenate((self.prev_joint_positions.flatten(), self.prev_root_velocity))
-        #print("decoderinputshade", self.prev_joint_positions.flatten().shape, self.prev_root_velocity.shape)
         decoder_input = torch.cat([
             self.prev_joint_positions.flatten(),
             self.prev_root_velocity,
-            torch.tensor(self.target_skeleton_offset.flatten(), dtype=torch.float32),
+            torch.tensor(self.target_joint_offset.flatten(), dtype=torch.float32),
             self.target_geo_embedding,
             self.h_enc.flatten(),
         ], dim=0).unsqueeze(0).unsqueeze(0)  # (batch_size, 1, decoder_input_size)
@@ -113,21 +106,12 @@ class BaseModel(nn.Module):
         return local_rotation, root_velocity
     
     def forward(self, rotation, velocity):
-        """
-        전체 모델의 순전파
-        """
-        # 인코딩
-        #print("Started encoding...")
+
         self.encode(rotation, velocity)
 
-        # 디코딩
-        #print("Started Decoding...")
         local_rotations, root_velocity = self.decode()
 
         self.prev_root_velocity = root_velocity
-        #print(self.prev_root_velocity[-1])
-
-        #joint_positions = self.fk_layer(local_rotations[-1]) # [joint, 3]
         joint_positions = local_rotations
 
         self.prev_joint_positions = joint_positions
@@ -140,73 +124,54 @@ class BaseModel(nn.Module):
 
         return global_positions, vertex_positions
     
-    def testfoward(self, rotation, velocity):
-
-        #joint_positions = compute_bone_positions(rotation, self.target_skeleton, self.parent_list )
-        #
-        #
-        joint_quat, joint_pos = quat.fk(rotation, self.target_skeleton_offset[0], self.tgt_aPy_skel)
-        #joint_pos, joint_rot = compute_bone_positions(rotation, self.target_skeleton, self.parent_list, self.tgt_aPy_skel.v_up)
-        vertex_positions = self.skinning_layer(self.target_geo, self.target_skeleton_offset, self.ref_vertices)
-
-        self.clip.append(vertex_positions)
-        self.euler = []
-        print(type(vertex_positions))
-        for quats in joint_quat:
-            self.euler.append(quat.quaternion_to_euler(quats))
-        self.jclip.append(self.euler)
-        #print(len(self.jclip),len(self.jclip[-1]))
-        #print(self.jclip)
-    
-    
-    def saveanim(self):
-        save_to_obj(self.clip[0], self.ref_tris)
-        save("C:/Users/vml/Documents/GitHub/CARetargeting/models/output.bvh", 
-             self.jclip, self.clip, self.target_skeleton_offset, self.parent_list)
-        #save_animation_to_bvh("C:/Users/vml/Documents/GitHub/CARetargeting/models/output.bvh",
-        #                      np.array(self.jclip), self.parent_list ,self.target_skeleton)
-        print("done saveanim")
+    def testfoward(self, sequence, glob_root):
+        #print(sequence)
+        frame_rotations = sequence.local_quats  # [num_joints, 4]
+        frame_velocity = sequence.root_pos - sequence.root_pos # [3]
+        #joints = []
+        #for i in range(22):
+        #    joint_quat, joint_pos = quat.fk(frame_rotations[i], self.target_joint_offset[0], self.skeleton[0])
+        #    joints.append(quat.quaternion_to_euler(joint_quat))
+        #self.jclip.append(joints)
         
+        self.skinned_verts = linear_blend_skinning(torch.tensor(sequence.skeleton.pre_xforms,dtype=torch.float32).to(device), 
+                                                   sequence.skeleton.parent_idx, 
+                                                   torch.tensor(sequence.root_pos,dtype=torch.float32).to(device), 
+                                                   torch.tensor(self.target_joint_offset,dtype=torch.float32).to(device), 
+                                                   torch.tensor(sequence.local_quats,dtype=torch.float32).unsqueeze(0).to(device), 
+                                                   torch.tensor(self.ref_vpos,dtype=torch.float32).to(device), 
+                                                   torch.tensor(self.target_skinning,dtype=torch.float32).to(device))
+        #'''
+
+        '''
+        self.skinned_verts = linear_blend_skinning_2(self.skeleton, 
+                                                   self.skeleton.parent_idx, 
+                                                   sequence.root_pos,
+                                                   torch.tensor(self.target_joint_offset,dtype=torch.float32).to(device), 
+                                                   torch.tensor(frame_rotations,dtype=torch.float32).to(device), 
+                                                   torch.tensor(self.ref_vpos,dtype=torch.float32).to(device), 
+                                                   torch.tensor(self.target_skinning,dtype=torch.float32).to(device))
+        #'''
+
+
+        #vertex_positions = self.skinning_layer(self.target_skinning[0], self.target_joint_offset[0], self.ref_vpos)
+
+        #self.clip.append(vertex_positions)
+        
+    def printtype(self,t):
+        print(type(t))
+
+    
+    def saveanim(self,pose):
+        motion = Motion(pose)
+        motion.export_as_bvh("C:/Users/vml/Documents/GitHub/CARetargeting/models/asdf.bvh")
+        save_to_obj(self.skinned_verts.cpu().numpy(), self.ref_tris)
+
     
     def enc_optim(self):
         pass
 
-    def skinning_layer(self, target_geometry, bone_transforms, vertices):
-
-        # 결과를 저장할 배열 초기화
-        num_vertices = len(vertices)
-        skinned_vertices = np.zeros_like(vertices)
         
-        # 각 버텍스에 대해 스키닝 계산
-        for vertex_idx in range(num_vertices):
-            vertex_pos = vertices[vertex_idx]
-            weights_info = target_geometry[vertex_idx]
-            
-            # 현재 버텍스의 최종 위치를 계산
-            blended_position = np.zeros(3)
-            
-            # 각 영향받는 본에 대해 가중치를 적용하여 위치 계산
-            for jidx in range(22):
-                weight = weights_info[jidx]
-                if weight > 0:
-                    # 본 오프셋을 이용한 변환 계산
-                    bone_offset = bone_transforms[jidx]
-                    
-                    # 본 변환 행렬 계산 (여기서는 간단한 이동 변환만 적용)
-                    transformed_position = vertex_pos + bone_offset
-                    
-                    # 가중치를 적용하여 최종 위치에 더함
-                    blended_position += weight * transformed_position
-                
-                
-                
-            skinned_vertices[vertex_idx] = blended_position
-            
-        return skinned_vertices
-    
-    
-
-
 def save_to_obj(vertices, tris, filepath="C:/Users/vml/Documents/GitHub/CARetargeting/models/output.obj"):
     """
     스키닝된 버텍스와 폴리곤 정보를 OBJ 파일로 저장합니다.
@@ -216,21 +181,24 @@ def save_to_obj(vertices, tris, filepath="C:/Users/vml/Documents/GitHub/CARetarg
         tris: List[List[int]] - 삼각형을 구성하는 버텍스 인덱스 리스트 (CW 순서)
         filepath: str - 저장할 OBJ 파일 경로
     """
+    print(vertices.shape)
     with open(filepath, 'w') as f:
         # 파일 헤더 작성
         f.write("# Exported by LBS Skinning Validator\n")
         f.write("# Vertices: {}\n".format(len(vertices)))
         f.write("# Faces: {}\n\n".format(len(tris)))
+        #self.clip.append(vertex_positions)
         
         # 버텍스 정보 작성
-        for vertex in vertices:
+        for vertex in vertices[0]:
+            #print(vertex)
             #print(vertex)
             # OBJ 파일은 Y-up 좌표계를 사용하므로, 필요한 경우 여기서 좌표계 변환을 수행할 수 있습니다
             f.write("v {:.6f} {:.6f} {:.6f}\n".format(vertex[0], vertex[1], vertex[2]))
         
         f.write("\n")
-        
-        # 폴리곤 정보 작성
+
+         # 폴리곤 정보 작성
         # OBJ 파일의 인덱스는 1부터 시작하므로 1을 더해줍니다
         for tri in tris:
             #print(tri)
@@ -238,3 +206,5 @@ def save_to_obj(vertices, tris, filepath="C:/Users/vml/Documents/GitHub/CARetarg
             # f.write("f {} {} {}\n".format(tri[0]+1, tri[2]+1, tri[1]+1))
             # CW 유지
             f.write("f {} {} {}\n".format(tri[0]+1, tri[1]+1, tri[2]+1))
+
+    

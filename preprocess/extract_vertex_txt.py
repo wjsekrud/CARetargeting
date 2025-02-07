@@ -7,10 +7,11 @@ import numpy as np
 from mathutils import Vector
 
 class NewVertexExporter:
-    def __init__(self, mesh_obj):
+    def __init__(self, mesh_obj, scale=0.01):
         self.mesh_obj = mesh_obj
         self.vertex_groups = mesh_obj.vertex_groups
         self.mesh = mesh_obj.data
+        self.global_scale = scale
         self.end_effectors = ['mixamorig:Head', 'mixamorig:LeftHand', 'mixamorig:RightHand', 'mixamorig:LeftToeBase', 'mixamorig:RightToeBase']
 
     def calculate_geodesic_distance(self):
@@ -40,7 +41,7 @@ class NewVertexExporter:
                     
                 for edge in bm.verts[current_vertex].link_edges:
                     next_vertex = edge.other_vert(bm.verts[current_vertex])
-                    distance = edge.calc_length()
+                    distance = edge.calc_length() * self.global_scale
                     new_distance = distances[current_vertex] + distance
                     
                     if new_distance < distances[next_vertex.index]:
@@ -117,7 +118,7 @@ class NewVertexExporter:
         # z축 최대/최소값 차이로 높이 계산
         min_z = min(corner.z for corner in world_bbox)
         max_z = max(corner.z for corner in world_bbox)
-        return max_z - min_z
+        return (max_z - min_z) * self.global_scale
     
     def export_to_file(self, output_path):
         # 버텍스 그룹 생성
@@ -137,7 +138,7 @@ class NewVertexExporter:
         # 버텍스 데이터 수집
         for vertex_idx, vertex in enumerate(self.mesh.vertices):
             vertex_data = {
-                'position': list(vertex.co),  # [x, y, z]
+                'position': [coord * self.global_scale for coord in vertex.co], #list(vertex.co),  # [x, y, z]
                 'bone_weights': self._get_vertex_weights(vertex_idx),
                 'vertex_group': self._get_primary_group(vertex_idx)
             }
