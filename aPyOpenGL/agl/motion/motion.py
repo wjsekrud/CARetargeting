@@ -47,7 +47,7 @@ class Motion:
     def export_as_bvh(self, filename):
         self._save(filename)
 
-    def _save(self, filename, scale=100.0, rot_order="ZXY", verbose=False):
+    def _save(self, filename, scale=1, rot_order="ZXY", verbose=False):
         if verbose:
             print(" >  >  Save BVH file: %s" % filename)
         with open(filename, "w") as f:

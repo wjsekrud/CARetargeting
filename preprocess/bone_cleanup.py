@@ -1,8 +1,9 @@
 import bpy
 import os
 from pathlib import Path
+import mathutils
 from mathutils import Vector
-
+import bmesh
 
 def read_bone_names(filepath):
     """본 이름 목록이 있는 텍스트 파일을 읽어옵니다."""
@@ -83,7 +84,203 @@ def transfer_weights_to_parent(armature, bone_name, keep_bones):
             for idx, weight in zip(vertex_indices_to_update, weights_to_update):
                 parent_group.add([idx], weight, 'ADD')
 
-def cleanup_armature(fbx_path, bones_list_path, output_path, import_scale=1.0, export_scale=0.01):
+def normalize_armature_joints(armature_name):
+    """
+    아마추어의 모든 본들의 회전값을 정규화합니다.
+    본의 형태는 유지한 채로 회전값만 초기화합니다.
+    
+    Args:
+        armature_name (str): 정규화할 아마추어 오브젝트의 이름
+    """
+    # 아마추어 오브젝트 가져오기
+    if armature_name not in bpy.data.objects:
+        raise ValueError(f"Armature '{armature_name}' not found")
+    
+    armature = bpy.data.objects[armature_name]
+    if armature.type != 'ARMATURE':
+        raise ValueError(f"Object '{armature_name}' is not an armature")
+    
+    # 현재 모드 저장
+    current_mode = bpy.context.object.mode
+    
+    # 포즈 모드로 전환하여 회전값 초기화
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='POSE')
+    
+    # 각 포즈 본의 회전값 초기화
+    for pose_bone in armature.pose.bones:
+        # 현재 본의 월드 매트릭스 저장
+        world_matrix = pose_bone.matrix.copy()
+        
+        # 회전값 초기화
+        pose_bone.rotation_euler = mathutils.Euler((0, 0, 0))
+        pose_bone.rotation_quaternion = mathutils.Quaternion((1, 0, 0, 0))
+        
+        # 본의 제약 조건들도 초기화
+        for constraint in pose_bone.constraints:
+            if hasattr(constraint, 'influence'):
+                constraint.influence = 0
+    
+    # 이전 모드로 복귀
+    bpy.ops.object.mode_set(mode=current_mode)
+
+def apply_rest_pose(armature_name):
+    """
+    현재 포즈를 레스트 포즈로 적용합니다.
+    
+    Args:
+        armature_name (str): 레스트 포즈를 적용할 아마추어 오브젝트의 이름
+    """
+    armature = bpy.data.objects[armature_name]
+    bpy.context.view_layer.objects.active = armature
+    
+    # 현재 포즈를 레스트 포즈로 적용
+    bpy.ops.object.mode_set(mode='POSE')
+    bpy.ops.pose.armature_apply()
+    
+    # 오브젝트 모드로 복귀
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+def apply_transforms_to_armature_meshes(armature_name):
+    """
+    지정된 아마추어에 연결된 모든 메시들의 트랜스폼을 적용합니다.
+    
+    Args:
+        armature_name (str): 아마추어 오브젝트의 이름
+    """
+    # 아마추어 확인
+    if armature_name not in bpy.data.objects:
+        raise ValueError(f"Armature '{armature_name}' not found")
+        
+    armature = bpy.data.objects[armature_name]
+    if armature.type != 'ARMATURE':
+        raise ValueError(f"Object '{armature_name}' is not an armature")
+    
+    # 현재 선택된 객체들 저장
+    original_selection = bpy.context.selected_objects
+    original_active = bpy.context.active_object
+    
+    # 아마추어와 연결된 메시 찾기
+    meshes_to_process = []
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH':
+            # 아마추어 모디파이어가 있는지 확인
+            for modifier in obj.modifiers:
+                if modifier.type == 'ARMATURE' and modifier.object == armature:
+                    meshes_to_process.append(obj)
+                    break
+    
+    if not meshes_to_process:
+        print(f"No meshes found connected to armature '{armature_name}'")
+        return
+    
+    # 모든 객체 선택 해제
+    bpy.ops.object.select_all(action='DESELECT')
+    
+    # 각 메시에 대해 transform 적용
+    for mesh in meshes_to_process:
+        # 메시 선택 및 활성화
+        mesh.select_set(True)
+        bpy.context.view_layer.objects.active = mesh
+        
+        # 모든 transform 적용
+        bpy.ops.object.transform_apply(
+            location=True, 
+            rotation=True, 
+            scale=True
+        )
+        
+        # 선택 해제
+        mesh.select_set(False)
+        print(f"Applied transforms to mesh: {mesh.name}")
+    
+    # 원래 선택 상태 복원
+    for obj in original_selection:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = original_active
+    
+    print(f"Successfully applied transforms to all meshes connected to {armature_name}")
+
+
+def cleanup_and_quadriflow_remesh(obj_name, target_faces=3000):
+    """
+    메시를 정리하고 QuadriFlow Remesh를 적용합니다.
+    분리된 부분들을 제거하고 가장 큰 연결된 부분만 남깁니다.
+    
+    Args:
+        obj_name (str): 리메시할 오브젝트의 이름
+        target_faces (int): 목표 페이스 수 (기본값: 3000)
+    """
+    # 오브젝트 선택
+    if obj_name not in bpy.data.objects:
+        raise ValueError(f"Object '{obj_name}' not found")
+        
+    obj = bpy.data.objects[obj_name]
+    if obj.type != 'MESH':
+        raise ValueError(f"Object '{obj_name}' is not a mesh")
+    
+    # 활성 오브젝트로 설정
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    
+    # 편집 모드로 전환
+    bpy.ops.object.mode_set(mode='EDIT')
+    
+    # bmesh 생성
+    bm = bmesh.from_edit_mesh(obj.data)
+    
+    # 분리된 부분들 찾기
+    separate_parts = []
+    tagged_verts = set()
+    
+    def flood_select(start_vert):
+        """시작 버텍스에서 연결된 모든 버텍스를 찾습니다"""
+        connected_verts = set()
+        to_process = {start_vert}
+        
+        while to_process:
+            vert = to_process.pop()
+            if vert not in connected_verts:
+                connected_verts.add(vert)
+                # 연결된 엣지를 통해 이웃한 버텍스들 찾기
+                for edge in vert.link_edges:
+                    other_vert = edge.other_vert(vert)
+                    if other_vert not in connected_verts:
+                        to_process.add(other_vert)
+        
+        return connected_verts
+    
+    # 모든 분리된 부분 찾기
+    for vert in bm.verts:
+        if vert not in tagged_verts:
+            connected = flood_select(vert)
+            separate_parts.append(connected)
+            tagged_verts.update(connected)
+    
+    # 가장 큰 부분 찾기
+    largest_part = max(separate_parts, key=len)
+    
+    # 가장 큰 부분이 아닌 버텍스들 선택
+    for vert in bm.verts:
+        vert.select = vert not in largest_part
+    
+    # 선택된 버텍스(작은 부분들) 삭제
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.delete(type='VERT')
+    
+    # 오브젝트 모드로 돌아가기
+    bpy.ops.object.mode_set(mode='OBJECT')
+    
+    # QuadriFlow Remesh 적용
+    bpy.ops.object.quadriflow_remesh(
+        target_faces=target_faces,
+        use_mesh_symmetry=True,
+    )
+    
+    print(f"Successfully cleaned up and remeshed {obj_name} with {target_faces} target faces")
+
+
+def cleanup_armature(fbx_path, bones_list_path, output_path, import_scale=1.0, export_scale=1):
     """메인 처리 함수"""
     # 기존 씬 초기화
     bpy.ops.object.select_all(action='SELECT')
@@ -138,6 +335,12 @@ def cleanup_armature(fbx_path, bones_list_path, output_path, import_scale=1.0, e
     # 오브젝트 모드로 복귀
     bpy.ops.object.mode_set(mode='OBJECT')
 
+    for obj in bpy.data.objects:
+        if obj.type == 'ARMATURE':
+            normalize_armature_joints(obj.name)
+            apply_rest_pose(obj.name)
+            break
+
     # 모든 메쉬 선택 후 부모 해제
     for obj in bpy.data.objects:
         if obj.type == 'MESH':
@@ -159,19 +362,21 @@ def cleanup_armature(fbx_path, bones_list_path, output_path, import_scale=1.0, e
     active_obj = bpy.context.active_object
     remesh = active_obj.modifiers.new(name="Remesh", type='REMESH')
     remesh.mode = 'VOXEL'
+    #cleanup_and_quadriflow_remesh(active_obj.name, target_faces=3000)
     # 캐릭터 크기 계산
     bbox_corners = [active_obj.matrix_world @ Vector(corner) for corner in active_obj.bound_box]
     bbox_size = (max(v.x for v in bbox_corners) - min(v.x for v in bbox_corners),
                 max(v.y for v in bbox_corners) - min(v.y for v in bbox_corners),
                 max(v.z for v in bbox_corners) - min(v.z for v in bbox_corners))
     character_height = bbox_size[2]  # Z축 높이
-    print(character_height)
-    
+
     # 캐릭터 높이 기준 voxel size 계산 (기본 2m 캐릭터 기준 2.5cm로 설정)
     BASE_HEIGHT = 2.0  # 기준 캐릭터 높이(m)
     BASE_VOXEL_SIZE = 2  # 기준 voxel size(m)
     remesh.voxel_size = (character_height / BASE_HEIGHT) * BASE_VOXEL_SIZE
     bpy.ops.object.modifier_apply(modifier=remesh.name)
+    print(character_height)
+
     
     # 자동 스키닝
     active_obj.select_set(True)

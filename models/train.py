@@ -40,7 +40,7 @@ def train_model(params, epoches=1000, warmup_epochs=50):
                 #======================================================================/
                 
                 # Process single frame
-                #frame_gp, frame_vp = model(frame_rotations,frame_velocity)
+                #frame_gp, frame_vp = model(batch_sequences[0], batch_sequences[0].root_pos)
                 model.testfoward(batch_sequences[0], batch_sequences[0].root_pos)
 
                 '''

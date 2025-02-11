@@ -57,6 +57,7 @@ class BaseModel(nn.Module):
         self.rotation_layer = nn.Linear(dec_hidden_size, 66)
         self.velocity_layer = nn.Linear(dec_hidden_size, 3)
 
+
     def setupmesh(self, vpos, vskin, vskine, joint_offsets, Skeleton, tris):
         self.ref_vpos = vpos
         self.target_skinning = vskin,
@@ -105,9 +106,13 @@ class BaseModel(nn.Module):
         
         return local_rotation, root_velocity
     
-    def forward(self, rotation, velocity):
+    def forward(self, sequence, prev_root):
 
-        self.encode(rotation, velocity)
+
+        frame_rotations = sequence.local_quats
+        frame_velocity = sequence.root_pos - prev_root
+
+        self.encode(frame_rotations, frame_velocity)
 
         local_rotations, root_velocity = self.decode()
 
@@ -118,7 +123,17 @@ class BaseModel(nn.Module):
 
         pos_reshaped = joint_positions.reshape(-1,3)
         global_positions = (pos_reshaped * root_velocity).flatten()
-        vertex_positions = self.skinning_layer(self.target_geo, joint_positions, self.ref_vertices)
+        vertex_positions = linear_blend_skinning_2(self.skeleton, 
+                                                   self.skeleton.parent_idx, 
+                                                   sequence.root_pos * -0.5,
+                                                   torch.tensor(self.target_joint_offset ,dtype=torch.float64).to(device), 
+                                                   torch.tensor(frame_rotations,dtype=torch.float64).unsqueeze(0).to(device), 
+                                                   torch.tensor(self.ref_vpos,dtype=torch.float64).to(device), 
+                                                   torch.tensor(self.target_skinning,dtype=torch.float64).to(device)).squeeze(0)  
+        vertex_positions[:,1] = self.skinned_verts[:,1] + sequence.root_pos[1] * 1.5
+
+
+
         self.global_positions = global_positions
         self.vertex_positions = vertex_positions
 
@@ -133,7 +148,8 @@ class BaseModel(nn.Module):
         #    joint_quat, joint_pos = quat.fk(frame_rotations[i], self.target_joint_offset[0], self.skeleton[0])
         #    joints.append(quat.quaternion_to_euler(joint_quat))
         #self.jclip.append(joints)
-        
+        print(sequence.root_pos, - self.target_joint_offset[0])
+        '''
         self.skinned_verts = linear_blend_skinning(torch.tensor(sequence.skeleton.pre_xforms,dtype=torch.float32).to(device), 
                                                    sequence.skeleton.parent_idx, 
                                                    torch.tensor(sequence.root_pos,dtype=torch.float32).to(device), 
@@ -143,15 +159,17 @@ class BaseModel(nn.Module):
                                                    torch.tensor(self.target_skinning,dtype=torch.float32).to(device))
         #'''
 
-        '''
+        #'''
         self.skinned_verts = linear_blend_skinning_2(self.skeleton, 
                                                    self.skeleton.parent_idx, 
-                                                   sequence.root_pos,
-                                                   torch.tensor(self.target_joint_offset,dtype=torch.float32).to(device), 
-                                                   torch.tensor(frame_rotations,dtype=torch.float32).to(device), 
-                                                   torch.tensor(self.ref_vpos,dtype=torch.float32).to(device), 
-                                                   torch.tensor(self.target_skinning,dtype=torch.float32).to(device))
+                                                   sequence.root_pos * -0.5,
+                                                   torch.tensor(self.target_joint_offset ,dtype=torch.float64).to(device), 
+                                                   torch.tensor(frame_rotations,dtype=torch.float64).unsqueeze(0).to(device), 
+                                                   torch.tensor(self.ref_vpos,dtype=torch.float64).to(device), 
+                                                   torch.tensor(self.target_skinning,dtype=torch.float64).to(device)).squeeze(0)  
+        self.skinned_verts[:,1] = self.skinned_verts[:,1] + sequence.root_pos[1] * 1.5
         #'''
+        
 
 
         #vertex_positions = self.skinning_layer(self.target_skinning[0], self.target_joint_offset[0], self.ref_vpos)
@@ -190,7 +208,7 @@ def save_to_obj(vertices, tris, filepath="C:/Users/vml/Documents/GitHub/CARetarg
         #self.clip.append(vertex_positions)
         
         # 버텍스 정보 작성
-        for vertex in vertices[0]:
+        for vertex in vertices:
             #print(vertex)
             #print(vertex)
             # OBJ 파일은 Y-up 좌표계를 사용하므로, 필요한 경우 여기서 좌표계 변환을 수행할 수 있습니다

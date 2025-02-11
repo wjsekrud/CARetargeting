@@ -35,10 +35,11 @@ class NewVertexExporter:
             
             while pq:
                 current_distance, current_vertex = heapq.heappop(pq)
-                
+
                 if current_distance > distances[current_vertex]:
                     continue
                     
+
                 for edge in bm.verts[current_vertex].link_edges:
                     next_vertex = edge.other_vert(bm.verts[current_vertex])
                     distance = edge.calc_length() * self.global_scale
@@ -47,6 +48,7 @@ class NewVertexExporter:
                     if new_distance < distances[next_vertex.index]:
                         distances[next_vertex.index] = new_distance
                         heapq.heappush(pq, (new_distance, next_vertex.index))
+
             
             return distances
 

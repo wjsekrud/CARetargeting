@@ -27,7 +27,7 @@ ordermap = {
 }
 
 class BVH:
-    def __init__(self, filename: str, target_fps=30, scale=0.01):
+    def __init__(self, filename: str, target_fps=30, scale=1):
         self.filename = filename
         self.target_fps = target_fps
         self.scale = scale

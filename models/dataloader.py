@@ -21,12 +21,13 @@ class PrepDataloader(Dataset):
         self.loadfiles(src_name,tgt_name)
         self.setvertinfo()
 
-        self.tgtchar_skel = BVH(str(self.tgt_char_file)).poses[0].skeleton
+        self.tgtchar_skel = BVH(str(self.tgt_char_file),scale=1).poses[0].skeleton
         self.tgt_joint_offset = np.zeros((len(self.tgtchar_skel.joints),3), dtype=np.float32) # 조인트 오프셋
         #self.tgt_joint_localrot = np.zeros((len(self.tgtchar_skel.joints),4), dtype=np.float32) # 조인트 로테이션
 
         for i in range(len(self.tgtchar_skel.joints)):
             self.tgt_joint_offset[i] = self.tgtchar_skel.joints[i].local_pos
+            print(self.tgt_joint_offset[i])
 
     def getmesh(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Skeleton, np.ndarray]:
         """
