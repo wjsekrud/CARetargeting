@@ -7,7 +7,7 @@ import numpy as np
 from mathutils import Vector
 
 class NewVertexExporter:
-    def __init__(self, mesh_obj, scale=0.01):
+    def __init__(self, mesh_obj, scale=1):
         self.mesh_obj = mesh_obj
         self.vertex_groups = mesh_obj.vertex_groups
         self.mesh = mesh_obj.data

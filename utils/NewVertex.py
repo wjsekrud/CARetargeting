@@ -20,7 +20,7 @@ class NewVertex:
             for line in vertex_lines:
                 position, bone_weight, vertex_group = line.strip().split('|')
                 new_vertex = cls()
-                new_vertex.position = list(map(float, position.split(',')))
+                new_vertex.position = [x*0.01 for x in list(map(float, position.split(',')))]
                 new_vertex.vertex_group = int(vertex_group)
                 new_vertex.bone_weights = [
                     {

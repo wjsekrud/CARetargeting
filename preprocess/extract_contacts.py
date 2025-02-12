@@ -207,8 +207,8 @@ class ContactDetector:
         for p1 in pos1_current:
             for p2 in pos2_current:
                 dist = (p1 - p2).length
-                
                 min_distance = min(min_distance, dist)
+                
         print(f"mind: {min_distance}")
         
                 

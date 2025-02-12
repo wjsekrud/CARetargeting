@@ -50,11 +50,12 @@ class PrepDataloader(Dataset):
             None,
             self.tgt_joint_offset,
             self.tgtchar_skel,
-            np.array(tris)
+            np.array(tris),
+            self.tgt_h
         )
     
     def getanim(self, idx:int):
-        return self.motion_sequences[idx]
+        return (self.motion_sequences[idx], self.seq_contacts[idx])
     
     def loadfiles(self,src_name,tgt_name):
         #src_v_path = Path(f"./dataset/vertexes/{src_name}_clean_vertices.txt")
@@ -62,14 +63,32 @@ class PrepDataloader(Dataset):
         #self.src_vertices, self.src_tris, self.src_h = load_from_simple_txt(src_v_path)
         self.tgt_vertices, self.tgt_tris, self.tgt_h = load_from_simple_txt(tgt_v_path)
         src_anim_path = Path(f"./dataset/Animations/bvhs/{src_name}")
+        src_contact_path = Path(f"./dataset/Contacts/{src_name}")
 
         self.src_anim_files = list(src_anim_path.glob("*.bvh"))
         self.tgt_char_file = list(Path(f"./dataset/Animations/bvhs/{tgt_name}").glob("*.bvh"))[0] #character file
         print("target character geo file: ", self.tgt_char_file)
 
+        self.src_contact_files = list(src_contact_path.glob("*.txt"))
+
         for bvh_file in self.src_anim_files:           
             newpose = BVH(str(bvh_file)).poses
             self.motion_sequences.append(newpose) 
+
+        self.seq_contacts = []
+        for cont_file in self.src_contact_files:
+            self.seq_contacts.append(self.parsecontactinfo(cont_file))
+            
+    def parsecontactinfo(self,file):
+        frame_contacts = []
+        with open(file, 'r') as f:
+            lines = f.readlines()
+            for line in lines:
+                frame_contacts.append([0])
+                frame_contacts[-1][0] = int(line.split("|")[0])
+                for pair in line.split("|")[1:-1]:
+                    frame_contacts[-1].append((int(pair.split(",")[0]), int(pair.split(",")[1])))
+        return frame_contacts
 
 
     def setvertinfo(self):

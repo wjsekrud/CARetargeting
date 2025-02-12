@@ -22,7 +22,7 @@ def linear_blend_skinning(pre_xforms, parents, root_pos, bone_offset, quats, res
     
     # pre-xforms 적용
     pre_xforms_cl = pre_xforms.clone()      # (J, 4, 4)
-    print(pre_xforms)
+    #print(pre_xforms)
     pre_quats  = trf_t.xform.to_quat(pre_xforms_cl)                                    # (J, 4)
 
     ids = trf_t.quat.identity()[None].repeat(J, 1).cuda(quats.device)  # (1, 4) -> (J, 4)
