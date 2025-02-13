@@ -3,13 +3,12 @@ import torch.nn as nn
 import numpy as np
 import sys
 sys.path.append("./")
-from utils.bvhexporter import save
-#from aPyOpenGL.transforms.numpy import quat
 from aPyOpenGL.transforms.torch import quat
 from aPyOpenGL.agl.motion import Skeleton
 from aPyOpenGL.agl.motion import Motion
 from utils.LBS import linear_blend_skinning_2
 from utils.tensorBVH import detect_mesh_collisions_parallel
+from utils.FastMarching import compute_geodesic_distance, compute_geodesic_distances_batch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(torch.cuda.is_available())
 
@@ -36,6 +35,8 @@ class BaseModel(nn.Module):
         self.prev_root_velocity = torch.zeros(3).to(device)
         self.global_positions = torch.zeros(66).to(device)
         self.skeleton = Skeleton()
+
+
 
         self.setupmesh(target_vpos, target_skinning, geo_embedding, target_offsets, target_aPy_skel, target_tris, None)
 
@@ -118,7 +119,7 @@ class BaseModel(nn.Module):
         self.encode(frame_rotations, frame_velocity)
 
         local_rotations, root_velocity = self.decode()
-        joint_quat, joint_pos = quat.fk(local_rotations.reshape(-1,4), torch.tensor(sequence.root_pos), self.skeleton) #fk layer
+        self.joint_quat, joint_pos = quat.fk(local_rotations.reshape(-1,4), torch.tensor(sequence.root_pos), self.skeleton) #fk layer
 
         self.prev_root_velocity = root_velocity
 
@@ -131,7 +132,7 @@ class BaseModel(nn.Module):
                                                    self.skeleton.parent_idx, 
                                                    rpos, #y좌표만 줄여줘야 함
                                                    self.target_joint_offset, 
-                                                   joint_quat,
+                                                   self.joint_quat,
                                                    self.ref_vpos, 
                                                    self.target_skinning).squeeze(0) #skinning layer
         vertex_positions = vertex_positions[0]
@@ -146,10 +147,10 @@ class BaseModel(nn.Module):
         print(self.ref_vpos.shape, vpos.shape, self.ref_tris.shape)
         return detect_mesh_collisions_parallel(self.ref_vpos, self.ref_tris)#, self.height)
 
-    def compute_geometry_energy(self, gpos, vpos, ref_contacts, contacts, lamb=0.5, beta=0.9, gamma=0.2):
+    def compute_geometry_energy(self, vpos, ref_contacts, contacts, eta, lamb=0.5, beta=0.9, gamma=0.2):
         j2j = self.j2j_energy(vpos, ref_contacts)
-        interp = self.int_energy(vpos, contacts)
-        foot = self.foot_energy(gpos)
+        interp = self.int_energy(vpos, contacts, eta)
+        foot = self.foot_energy()
 
         return lamb * j2j + beta * interp + gamma * foot
 
@@ -157,51 +158,123 @@ class BaseModel(nn.Module):
         V_len_inv = 1/len(ref_contacts)
         sum = 0
         for v1, v2 in ref_contacts:
-            dx = vpos[v1][0] - vpos[v2][0]
-            dy = vpos[v1][1] - vpos[v2][1]
-            dz = vpos[v1][2] - vpos[v2][2]
-            L2 = torch.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+            L2 = torch.dist(vpos[v1], vpos[v2])
             sum += L2
         return sum * V_len_inv
 
-    def int_energy(self, vpos, contacts):
+    def int_energy(self, vpos, contacts, eta):
         Fsum = 0
-        jsum = 0
-        ksum = 0
+        v1list, v2list = [], []
         for p1, p2 in contacts:
-            for idx in self.ref_tris[p1]:
-                vpos = self.vertex_positions[idx]
-                w = self.compare_geodesic_distance(vpos,p2)
-                jsum += w * self.calc_distance_field(vpos, self.ref_tris)
-
-            for idx in self.ref_tris[p2]:
-                vpos = self.vertex_positions[idx]
-                w = self.compare_geodesic_distance(vpos,p1)
-                ksum += w * self.calc_distance_field(vpos, self.ref_tris)
+            for idx1, idx2 in (self.ref_tris[p1], self.ref_tris[p2]):
+                v1pos = self.vertex_positions[idx1]
+                v2pos = self.vertex_positions[idx2]
+                v1list.append(v1pos)
+                v2list.append(v2pos)
             
-            Fsum += jsum + ksum
+            w = self.calc_geodesic_distance(v1list, v2list) / eta
+
+            for idx in range(3):
+                Fsum += w * (self.calc_distance_field(v1list[idx], v2list) 
+                            +self.calc_distance_field(v2list[idx], v1list))
+
         return Fsum
 
     def calc_distance_field(self, vertex, polygon):
-        pass
 
-    def compare_geodesic_distance(self, v1, v2):
-        pass
+        vertex = torch.tensor(vertex).cuda()
+        polygon = torch.tensor(polygon).cuda()
 
-    def foot_energy(self, gpos):
-        pass
+        edge1 = polygon[1] - polygon[0]
+        edge2 = polygon[2] - polygon[0]
+        normal = torch.cross(edge1, edge2)
 
-    def compute_skeleton_energy(self, omega=0.2):
-        weak = self.weak_energy()
-        ee = self.ee_energy()
+        normal = normal / torch.linalg.vector_norm(normal)
+
+        A, B, C = polygon[0], polygon[1], polygon[2]
+        mid_AB = (A + B) / 2
+        mid_BC = (B + C) / 2
+        edge_AB = B - A
+        edge_BC = C - B
+        perp_AB = torch.cross(edge_AB, normal)
+        perp_BC = torch.cross(edge_BC, normal)
+        A_matrix = torch.stack([perp_AB, perp_BC], dim=0)[:, :2]  # Drop Z-component
+        b_vector = torch.stack([torch.dot(perp_AB, mid_AB), torch.dot(perp_BC, mid_BC)])
+        circumcenter_2d = torch.linalg.lstsq(A_matrix, b_vector).solution
+
+        circumcenter = torch.cat([circumcenter_2d, mid_AB[2].unsqueeze(0)])
+        circumradius = torch.linalg.vector_norm(circumcenter - A)
+
+        def psi(Vt, n, o, r):
+            Phi = phi(Vt, n, o, r)
+            if Phi < 1:
+                return abs((1 - Phi) * upsilon((torch.dot(normal,(Vt - circumcenter))))) ** 2
+            else:
+                return 0
+
+        def phi(Vt, n, o, r, sigma=0.5):
+            diff = Vt - o
+            proj = (torch.dot(n, diff)) * n
+            perp_component = diff - proj
+
+            numerator = torch.linalg.vector_norm(perp_component)
+            denominator = (-r / sigma) * torch.dot(n, diff) + r
+
+            return numerator / denominator
+
+        def upsilon(x, sigma=0.5):
+            if x <= -sigma:
+                return -x + 1 - sigma
+            elif x >= sigma:
+                return 0
+            else:
+                return (2 * sigma - 1) * (x ** 2) / (4 * (sigma ** 2)) - x / (2 * sigma) + (3 - 2 * sigma) / 4
+        
+        return torch.linalg.vector_norm(-1 * psi(vertex, normal, circumcenter, circumradius) * normal) ** 2
+
+    def calc_geodesic_distance(self, v1, v2):
+        v1t = torch.tensor(v1).flatten().cuda()
+        v2t = torch.tensor(v2).flatten().cuda()
+
+        print("startgcalc")
+        distances = compute_geodesic_distances_batch(self.ref_vpos, self.ref_tris, v1t, v2t)
+        print("donegcalc")
+
+        return distances.min()
+
+
+    def foot_energy(self):
+        jsum = 0
+        for jpos, prev_jpos in (self.target_joint_offset, self.prev_joint_positions):
+            if jpos[1] < 0.5:
+                vel = torch.dist(jpos, prev_jpos)
+                jsum += (vel + jpos[1])/self.height
+        return jsum
+
+    def compute_skeleton_energy(self, src_rotation, src_rvelocity, src_height, rho=0.9, omega=0.2):
+        weak = self.weak_energy(src_rotation, src_rvelocity, src_height, rho)
+        ee = self.ee_energy(src_height, src_rotation)
 
         return weak + omega * ee
 
-    def weak_energy(self):
-        pass
+    def weak_energy(self, src_rotation, src_rvelocity, src_height, rho):
+        L2_rot = 0
+        for i in range(len(src_rotation)):
+            L2_rot += torch.dist(self.joint_quat[i], src_rotation[i]) ** 2
+        scaled_rvel = src_rvelocity * (self.height/src_height)
+        L2_vel = torch.dist(self.prev_root_velocity, scaled_rvel) ** 2
+        
+        return rho * L2_rot + L2_vel
 
-    def ee_energy(self):
-        pass
+    def ee_energy(self, src_height, src_rotation):
+        ee_idx = (9,13,16,20)
+        jsum = 0
+        for idx in ee_idx:
+            src = src_rotation[idx] / src_height
+            tgt = self.joint_quat[idx] / self.height
+            jsum += torch.dist(src,tgt) ** 2
+
+        return jsum
 
 
 

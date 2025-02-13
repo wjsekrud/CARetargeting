@@ -41,13 +41,14 @@ def train_model(params, epoches=1000, warmup_epochs=50):
                 
                 # Process single frame
                 #frame_gp, frame_vp = model(batch_sequences[frame_idx], batch_sequences[max(frame_idx-1,0)].root_pos)
-                #
                 model.testfoward(batch_sequences[0], batch_sequences[0].root_pos)
-
+                for joint in batch_sequences[0].skeleton.joints:       
+                    print(joint.name)
+                
                 
                 # Detect contacts for current frame
 
-                '''
+                
                 print(f"exec dfc at frame{frame_idx}")
                 frame_contacts = model.detect_frame_contacts(frame_vp)
 
@@ -59,7 +60,7 @@ def train_model(params, epoches=1000, warmup_epochs=50):
                         ref_contacts = contacts[1:]
                         break
                 
-                
+                '''
                 # Compute loss for current frame
                 
                 geom_energy = model.compute_geometry_energy(

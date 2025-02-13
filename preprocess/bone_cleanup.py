@@ -279,6 +279,40 @@ def cleanup_and_quadriflow_remesh(obj_name, target_faces=3000):
     
     print(f"Successfully cleaned up and remeshed {obj_name} with {target_faces} target faces")
 
+def remove_mixamorig_prefix_from_armature(armature):
+    """아마추어의 모든 본 이름에서 'mixamorig:' 접두어를 제거합니다.
+    
+    Args:
+        armature: 본 이름을 수정할 아마추어 오브젝트
+    """
+    # 현재 모드 저장
+    current_mode = bpy.context.object.mode
+    
+    # 편집 모드로 전환
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
+    
+    # 본 이름 매핑 저장 (이전 이름 -> 새 이름)
+    bone_name_mapping = {}
+    
+    # 편집 모드에서 본 이름 변경
+    for bone in armature.data.edit_bones:
+        new_name = clean_bone_name(bone.name)
+        if new_name != bone.name:
+            bone_name_mapping[bone.name] = new_name
+            bone.name = new_name
+    
+    # 오브젝트 모드로 전환
+    bpy.ops.object.mode_set(mode='OBJECT')
+    
+    # 버텍스 그룹 이름도 업데이트
+    for mesh_obj in find_deformed_mesh(armature):
+        for vertex_group in mesh_obj.vertex_groups:
+            if vertex_group.name in bone_name_mapping:
+                vertex_group.name = bone_name_mapping[vertex_group.name]
+    
+    # 원래 모드로 복귀
+    bpy.ops.object.mode_set(mode=current_mode)
 
 def cleanup_armature(fbx_path, bones_list_path, output_path, import_scale=1.0, export_scale=1):
     """메인 처리 함수"""
@@ -383,6 +417,8 @@ def cleanup_armature(fbx_path, bones_list_path, output_path, import_scale=1.0, e
     armature.select_set(True)
     bpy.context.view_layer.objects.active = armature
     bpy.ops.object.parent_set(type='ARMATURE_AUTO')
+
+    remove_mixamorig_prefix_from_armature(armature)
     
     # 결과 FBX 저장
     bpy.ops.export_scene.fbx(
