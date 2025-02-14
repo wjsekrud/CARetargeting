@@ -142,6 +142,7 @@ def compute_geodesic_distances_batch(vertices: torch.Tensor,
             start_vertices[i].item(),
             end_vertices[i].item()
         )
+        print(distances[i])
     
     return distances
 

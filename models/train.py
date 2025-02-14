@@ -20,7 +20,7 @@ def train_model(params, epoches=1000, warmup_epochs=50):
         
         print(f"training for src:{params['src_chars'][i]}, tgt:{params['tgt_chars'][i]}")
 
-        vpos, vskin, _, joint_offsets, Skeleton, tris, height = dataloader.getmesh()
+        vpos, vskin, _, joint_offsets, Skeleton, tris, height, MGD = dataloader.getmesh()
         model.setupmesh(torch.tensor(vpos).to(device="cuda"),
                         torch.tensor(vskin).to(device="cuda"),
                         torch.zeros(64).to(device="cuda"),
@@ -40,54 +40,42 @@ def train_model(params, epoches=1000, warmup_epochs=50):
             for frame_idx in range(num_frames): #해당 애니메이션 내부의 각 프레임에서 처리되는 분기
                 
                 # Process single frame
-                #frame_gp, frame_vp = model(batch_sequences[frame_idx], batch_sequences[max(frame_idx-1,0)].root_pos)
-                model.testfoward(batch_sequences[0], batch_sequences[0].root_pos)
-                for joint in batch_sequences[0].skeleton.joints:       
-                    print(joint.name)
-                
-                
-                # Detect contacts for current frame
-
+                frame_gp, frame_vp = model(batch_sequences[frame_idx], batch_sequences[max(frame_idx-1,0)].root_pos)
+                #model.testfoward(batch_sequences[0], batch_sequences[0].root_pos)
                 
                 print(f"exec dfc at frame{frame_idx}")
                 frame_contacts = model.detect_frame_contacts(frame_vp)
+                ref_contacts = [0]
 
-                if frame_contacts != []:
-                    print(f"contacts: {len(frame_contacts)}")
+                #if frame_contacts != []:
+                #    print(f"contacts: {len(frame_contacts)}")
 
                 for contacts in batch_contacts:
                     if frame_idx == contacts[0]:
                         ref_contacts = contacts[1:]
                         break
                 
-                '''
-                # Compute loss for current frame
-                
-                geom_energy = model.compute_geometry_energy(
-                    frame_gp,
-                    frame_vp, 
-                    ref_contacts,
-                    frame_contacts
-                )
-                
-                skel_energy = model.compute_skeleton_energy(
-                    model.prev_joint_positions,
-                    model.global_positions
-                )
-
-                frame_energy = geom_energy + skel_energy
                 #'''
+                # Compute loss for current frame
+                frame_energy = model.energy_fuction(frame_vp, ref_contacts, frame_contacts, MGD,
+                                                    batch_sequences[frame_idx], batch_sequences[frame_idx].root_pos - batch_sequences[max(frame_idx-1,0)].root_pos, height,
+                                                    lamb=0.5, beta=0.9, gamma=0.2, rho=0.9, omega=0.2
+                                                    )
+                
+                #'''
+
+                #if epoch > warmup_epochs:
+                #    model.enc_optim()
 
                 # Backward pass and optimize
                 optimizer.zero_grad()
-                #frame_energy.backward()
+                frame_energy.backward()
                 optimizer.step()
-                #print("Step")
+                print("Step")
                 # Frame-wise encoder space optimization
-                if epoch > warmup_epochs:
-                    frame_output = model.enc_optim()
+                
             
-                model.saveanim(batch_sequences)
+                #model.saveanim(batch_sequences)
                 break
             break
         break

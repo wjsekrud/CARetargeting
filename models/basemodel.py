@@ -32,6 +32,7 @@ class BaseModel(nn.Module):
         self.h_enc = torch.zeros(2,1,enc_hidden_size).to(device)  # Encoder hidden state
         self.h_dec = torch.zeros(2,1,dec_hidden_size).to(device)  # Decoder hidden state
         self.prev_joint_positions = torch.zeros(66).to(device)
+        self.target_joint_offset = torch.zeros(66).to(device)
         self.prev_root_velocity = torch.zeros(3).to(device)
         self.global_positions = torch.zeros(66).to(device)
         self.skeleton = Skeleton()
@@ -142,10 +143,21 @@ class BaseModel(nn.Module):
         self.vertex_positions = vertex_positions
 
         return global_positions, vertex_positions
+
+    def energy_fuction(self, vpos, ref_contacts, contacts, eta, 
+                        src_rotation, src_rvelocity, src_height, 
+                        lamb=0.5, beta=0.9, gamma=0.2, rho=0.9, omega=0.2):
+        print("computeEnergy")
+        self.geomE = self.compute_geometry_energy(vpos, ref_contacts, contacts, eta, lamb, beta, gamma)
+        self.skelE = self.compute_skeleton_energy(src_rotation, src_rvelocity, src_height, rho, omega)
+
+        return self.geomE + self.skelE
+
     
     def detect_frame_contacts(self, vpos):
         print(self.ref_vpos.shape, vpos.shape, self.ref_tris.shape)
         return detect_mesh_collisions_parallel(self.ref_vpos, self.ref_tris)#, self.height)
+        
 
     def compute_geometry_energy(self, vpos, ref_contacts, contacts, eta, lamb=0.5, beta=0.9, gamma=0.2):
         j2j = self.j2j_energy(vpos, ref_contacts)
@@ -155,29 +167,40 @@ class BaseModel(nn.Module):
         return lamb * j2j + beta * interp + gamma * foot
 
     def j2j_energy(self, vpos, ref_contacts):
-        V_len_inv = 1/len(ref_contacts)
-        sum = 0
-        for v1, v2 in ref_contacts:
-            L2 = torch.dist(vpos[v1], vpos[v2])
-            sum += L2
-        return sum * V_len_inv
+        if len(ref_contacts) > 1:
+            V_len_inv = 1/len(ref_contacts)
+            sum = 0
+            for v1, v2 in ref_contacts:
+                L2 = torch.dist(vpos[v1], vpos[v2]) ** 2
+                sum += L2
+            return sum * V_len_inv
+        else:
+            return 0
 
     def int_energy(self, vpos, contacts, eta):
         Fsum = 0
-        v1list, v2list = [], []
-        for p1, p2 in contacts:
-            for idx1, idx2 in (self.ref_tris[p1], self.ref_tris[p2]):
-                v1pos = self.vertex_positions[idx1]
-                v2pos = self.vertex_positions[idx2]
-                v1list.append(v1pos)
-                v2list.append(v2pos)
+        
+        print(len(contacts))
+        for p1, p2 in contacts: #[3], [3] in contacts
+            idx1, idx2, v1list, v2list = [], [], [], []
+            for i in range(3):
+
+                idx1.append(self.ref_tris[p1][i])
+                idx2.append(self.ref_tris[p2][i])
+                v1pos = self.vertex_positions[idx1[-1]]
+                v2pos = self.vertex_positions[idx2[-1]]
+                v1list.append(v1pos.tolist())
+                v2list.append(v2pos.tolist())
+
             
-            w = self.calc_geodesic_distance(v1list, v2list) / eta
+            w = self.calc_geodesic_distance(idx1, idx2) / max(eta,1)
+            print("w: ", w)
 
             for idx in range(3):
                 Fsum += w * (self.calc_distance_field(v1list[idx], v2list) 
                             +self.calc_distance_field(v2list[idx], v1list))
-
+            print("Fsum: ", Fsum)
+        
         return Fsum
 
     def calc_distance_field(self, vertex, polygon):
@@ -187,7 +210,7 @@ class BaseModel(nn.Module):
 
         edge1 = polygon[1] - polygon[0]
         edge2 = polygon[2] - polygon[0]
-        normal = torch.cross(edge1, edge2)
+        normal = torch.linalg.cross(edge1, edge2)
 
         normal = normal / torch.linalg.vector_norm(normal)
 
@@ -196,8 +219,8 @@ class BaseModel(nn.Module):
         mid_BC = (B + C) / 2
         edge_AB = B - A
         edge_BC = C - B
-        perp_AB = torch.cross(edge_AB, normal)
-        perp_BC = torch.cross(edge_BC, normal)
+        perp_AB = torch.linalg.cross(edge_AB, normal)
+        perp_BC = torch.linalg.cross(edge_BC, normal)
         A_matrix = torch.stack([perp_AB, perp_BC], dim=0)[:, :2]  # Drop Z-component
         b_vector = torch.stack([torch.dot(perp_AB, mid_AB), torch.dot(perp_BC, mid_BC)])
         circumcenter_2d = torch.linalg.lstsq(A_matrix, b_vector).solution
@@ -233,6 +256,7 @@ class BaseModel(nn.Module):
         return torch.linalg.vector_norm(-1 * psi(vertex, normal, circumcenter, circumradius) * normal) ** 2
 
     def calc_geodesic_distance(self, v1, v2):
+
         v1t = torch.tensor(v1).flatten().cuda()
         v2t = torch.tensor(v2).flatten().cuda()
 
@@ -247,8 +271,8 @@ class BaseModel(nn.Module):
         jsum = 0
         for jpos, prev_jpos in (self.target_joint_offset, self.prev_joint_positions):
             if jpos[1] < 0.5:
-                vel = torch.dist(jpos, prev_jpos)
-                jsum += (vel + jpos[1])/self.height
+                vel = torch.dist(jpos, prev_jpos) ** 2
+                jsum += (vel + jpos[1] ** 2)/self.height
         return jsum
 
     def compute_skeleton_energy(self, src_rotation, src_rvelocity, src_height, rho=0.9, omega=0.2):
@@ -324,10 +348,47 @@ class BaseModel(nn.Module):
         motion.export_as_bvh("C:/Users/vml/Documents/GitHub/CARetargeting/models/asdf.bvh")
         save_to_obj(self.skinned_verts.cpu().numpy(), self.ref_tris)
 
-    
-    def enc_optim(self):
-        pass
+    def enc_optim(self, lr=0.003):
+        """한 timestep에 대한 optimization을 수행
 
+        Args:
+            hidden_enc: 현재 timestep의 encoder hidden state (h_enc)
+            root_velocity: 현재 timestep의 root velocity (o)
+            energy_func: full energy function E(t)를 계산하는 함수
+        
+        Returns:
+            tuple: (optimized hidden state, optimized root velocity)
+        """
+        '''
+        # gradient를 계산하기 위해 requires_grad 설정
+        self.h_enc = self.h_enc.detach().requires_grad_(True)
+        self.prev_root_velocity = self.prev_root_velocity.detach().requires_grad_(True)
+        #'''
+
+        for n in range(30):
+            # energy function 계산
+            energy = self.geomE + self.skelE
+            
+            # gradient 계산
+            energy.backward()
+            
+            with torch.no_grad():
+                # hidden state update (equation 10)
+                if self.h_enc.grad is not None:
+                    self.h_enc = self.h_enc - lr * self.h_enc.grad
+                    self.h_enc.grad.zero_()
+                
+                # root velocity update (equation 11)
+                if self.prev_root_velocity.grad is not None:
+                    self.prev_root_velocity = self.prev_root_velocity - lr * self.prev_root_velocity.grad
+                    self.prev_root_velocity.grad.zero_()
+            
+            # 다음 iteration을 위해 requires_grad 재설정
+            self.h_enc = self.h_enc.detach().requires_grad_(True)
+            self.prev_root_velocity = self.prev_root_velocity.detach().requires_grad_(True)
+        
+        return self.h_enc.detach(), self.prev_root_velocity.detach()
+    
         
 def save_to_obj(vertices, tris, filepath="C:/Users/vml/Documents/GitHub/CARetargeting/models/output.obj"):
     """

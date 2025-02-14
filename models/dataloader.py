@@ -51,7 +51,8 @@ class PrepDataloader(Dataset):
             self.tgt_joint_offset,
             self.tgtchar_skel,
             np.array(tris),
-            self.tgt_h
+            self.tgt_h,
+            self.tgt_MGD
         )
     
     def getanim(self, idx:int):
@@ -63,12 +64,12 @@ class PrepDataloader(Dataset):
     def loadfiles(self,src_name,tgt_name):
         
         tgt_v_path = Path(f"./dataset/vertexes/{tgt_name}_clean_vertices.txt")
-        self.tgt_vertices, self.tgt_tris, self.tgt_h = load_from_simple_txt(tgt_v_path)
+        self.tgt_vertices, self.tgt_tris, self.tgt_h, self.tgt_MGD = load_from_simple_txt(tgt_v_path)
         src_anim_path = Path(f"./dataset/Animations/bvhs/{src_name}")
         src_contact_path = Path(f"./dataset/Contacts/{src_name}")
 
         src_v_path = Path(f"./dataset/vertexes/{src_name}_clean_vertices.txt")
-        _, _, self.src_h = load_from_simple_txt(src_v_path)
+        _, _, self.src_h, _ = load_from_simple_txt(src_v_path)
 
         self.src_anim_files = list(src_anim_path.glob("*.bvh"))
         self.tgt_char_file = list(Path(f"./dataset/Animations/bvhs/{tgt_name}").glob("*.bvh"))[0] #character file

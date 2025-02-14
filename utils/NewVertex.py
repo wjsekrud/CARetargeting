@@ -13,6 +13,7 @@ class NewVertex:
         with open(file_path, 'r') as f:
             lines = f.readlines()
             height = float(lines[0].split(":")[1])
+            MGD = float(lines[1].split(":")[1])
             vertex_count = int(lines[2].split(":")[1])
             triangle_count = int(lines[3].split(":")[1])
 
@@ -36,7 +37,7 @@ class NewVertex:
                     'indices': list(map(int, line.split(','))),
                 })
 
-        return vertices, triangles, height
+        return vertices, triangles, height, MGD
     
 def load_from_simple_txt(file_path):
     return NewVertex.load_from_simple_txt(file_path)
