@@ -27,7 +27,7 @@ class PrepDataloader(Dataset):
 
         for i in range(len(self.tgtchar_skel.joints)):
             self.tgt_joint_offset[i] = self.tgtchar_skel.joints[i].local_pos
-            print(self.tgt_joint_offset[i])
+            #print(self.tgt_joint_offset[i])
 
     def getmesh(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Skeleton, np.ndarray]:
         """
@@ -55,8 +55,8 @@ class PrepDataloader(Dataset):
             self.tgt_MGD
         )
     
-    def getanim(self, idx:int):
-        return (self.motion_sequences[idx], self.seq_contacts[idx])
+    def __getitem__(self, item):
+        return (self.motion_sequences, self.seq_contacts)
     
     def getsrcinfo(self):
         return (self.src_h, )

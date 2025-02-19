@@ -12,6 +12,11 @@ from utils.FastMarching import compute_geodesic_distance, compute_geodesic_dista
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(torch.cuda.is_available())
 
+import cProfile
+import pstats
+
+
+
 class BaseModel(nn.Module):
     def __init__(self, 
                  input_size, 
@@ -37,11 +42,7 @@ class BaseModel(nn.Module):
         self.global_positions = torch.zeros(66).to(device)
         self.skeleton = Skeleton()
 
-
-
         self.setupmesh(target_vpos, target_skinning, geo_embedding, target_offsets, target_aPy_skel, target_tris, None)
-
-        self.clip, self.jclip = [], []
   
         self.encoder_gru = nn.GRU(
             input_size=input_size,  # 입력: [θᴬ, ωᴬ] (소스 캐릭터의 관절 각도와 각속도)
@@ -81,19 +82,14 @@ class BaseModel(nn.Module):
         """
         source_motion: [Time, Joint idx, 3] + [Time, Joint len + 1, 3]
         """
-            #print(rotation.shape, velocity.shape)
         source_motion = torch.tensor(np.concatenate((rotation.flatten(), velocity)),dtype=torch.float32).unsqueeze(1).to(device)
-            #print("encoderinputshape",source_motion.transpose(0,1).shape)
-        print(source_motion.device, self.h_enc.device)
-        encoder_outputs, encoder_hidden = self.encoder_gru(source_motion.transpose(0,1).unsqueeze(0), self.h_enc)
-        self.h_enc = encoder_hidden
-
-        return encoder_outputs, encoder_hidden
+        encoder_outputs, self.h_enc = self.encoder_gru(source_motion.transpose(0,1).unsqueeze(0), self.h_enc.detach())
+        return 
     
     def decode(self):
         """
         encoder_hidden: 인코더의 마지막 히든 스테이트
-        target_skeleton_embedding: PointNet으로 생성된 타깃 스켈레톤 임베딩
+        target_skeleton_embedding: PointNet으로 생성된 타깃 스켈레톤 임베딩 
         """
 
         decoder_input = torch.cat([
@@ -105,15 +101,14 @@ class BaseModel(nn.Module):
         ], dim=0).unsqueeze(0).unsqueeze(0)  # (batch_size, 1, decoder_input_size)
         
         # 디코더 실행
-        output, decoder_hidden = self.decoder_gru(decoder_input, self.h_dec)
-        self.h_dec = decoder_hidden
-
-        local_rotation = self.rotation_layer(decoder_hidden)[-1].squeeze()
-        root_velocity = self.velocity_layer(decoder_hidden)[-1].squeeze()
+        output, self.h_dec = self.decoder_gru(decoder_input, self.h_dec.detach())
+        local_rotation = self.rotation_layer(self.h_dec[-1]).squeeze()
+        root_velocity = self.velocity_layer(self.h_dec[-1]).squeeze()
         
         return local_rotation, root_velocity
     
     def forward(self, sequence, prev_root):
+    
         frame_rotations = sequence.local_quats
         frame_velocity = sequence.root_pos - prev_root
 
@@ -122,18 +117,20 @@ class BaseModel(nn.Module):
         local_rotations, root_velocity = self.decode()
         self.joint_quat, joint_pos = quat.fk(local_rotations.reshape(-1,4), torch.tensor(sequence.root_pos), self.skeleton) #fk layer
 
-        self.prev_root_velocity = root_velocity
+        self.prev_root_velocity = root_velocity.detach()
 
-        self.prev_joint_positions = joint_pos
+        self.foot_e = self.foot_energy(joint_pos) #prev 업데이트 전에 미리 계산
+
+        self.prev_joint_positions = joint_pos.detach()
         pos_reshaped = joint_pos.reshape(-1,3)
 
         rpos = np.array([sequence.root_pos[0], sequence.root_pos[1] * -0.5, sequence.root_pos[2]])
-        global_positions = (pos_reshaped * root_velocity).flatten()
+        global_positions = (pos_reshaped * self.prev_root_velocity).flatten()
         vertex_positions = linear_blend_skinning_2(self.skeleton, 
                                                    self.skeleton.parent_idx, 
                                                    rpos, #y좌표만 줄여줘야 함
                                                    self.target_joint_offset, 
-                                                   self.joint_quat,
+                                                   self.joint_quat.clone(),
                                                    self.ref_vpos, 
                                                    self.target_skinning).squeeze(0) #skinning layer
         vertex_positions = vertex_positions[0]
@@ -148,7 +145,7 @@ class BaseModel(nn.Module):
                         src_rotation, src_rvelocity, src_height, 
                         lamb=0.5, beta=0.9, gamma=0.2, rho=0.9, omega=0.2):
         print("computeEnergy")
-        self.geomE = self.compute_geometry_energy(vpos, ref_contacts, contacts, eta, lamb, beta, gamma)
+        self.geomE = 0#self.compute_geometry_energy(vpos, ref_contacts, contacts, eta, lamb, beta, gamma)
         self.skelE = self.compute_skeleton_energy(src_rotation, src_rvelocity, src_height, rho, omega)
 
         return self.geomE + self.skelE
@@ -162,7 +159,7 @@ class BaseModel(nn.Module):
     def compute_geometry_energy(self, vpos, ref_contacts, contacts, eta, lamb=0.5, beta=0.9, gamma=0.2):
         j2j = self.j2j_energy(vpos, ref_contacts)
         interp = self.int_energy(vpos, contacts, eta)
-        foot = self.foot_energy()
+        foot = self.foot_e
 
         return lamb * j2j + beta * interp + gamma * foot
 
@@ -172,7 +169,7 @@ class BaseModel(nn.Module):
             sum = 0
             for v1, v2 in ref_contacts:
                 L2 = torch.dist(vpos[v1], vpos[v2]) ** 2
-                sum += L2
+                sum = sum + L2
             return sum * V_len_inv
         else:
             return 0
@@ -180,7 +177,7 @@ class BaseModel(nn.Module):
     def int_energy(self, vpos, contacts, eta):
         Fsum = 0
         
-        print(len(contacts))
+        print("number of contacts:", len(contacts))
         for p1, p2 in contacts: #[3], [3] in contacts
             idx1, idx2, v1list, v2list = [], [], [], []
             for i in range(3):
@@ -197,7 +194,7 @@ class BaseModel(nn.Module):
             print("w: ", w)
 
             for idx in range(3):
-                Fsum += w * (self.calc_distance_field(v1list[idx], v2list) 
+                Fsum = Fsum + w * (self.calc_distance_field(v1list[idx], v2list) 
                             +self.calc_distance_field(v2list[idx], v1list))
             print("Fsum: ", Fsum)
         
@@ -267,24 +264,29 @@ class BaseModel(nn.Module):
         return distances.min()
 
 
-    def foot_energy(self):
+    def foot_energy(self, joint_positions):
         jsum = 0
-        for jpos, prev_jpos in (self.target_joint_offset, self.prev_joint_positions):
-            if jpos[1] < 0.5:
+        for i in range(3):
+            jpos = joint_positions[i]
+            prev_jpos = self.prev_joint_positions[i]
+
+            if jpos[1] < 0.5: #지면과 접촉중인 관절 검색
                 vel = torch.dist(jpos, prev_jpos) ** 2
-                jsum += (vel + jpos[1] ** 2)/self.height
+                jsum = jsum + (vel + jpos[1] ** 2)/self.height
+            
         return jsum
 
     def compute_skeleton_energy(self, src_rotation, src_rvelocity, src_height, rho=0.9, omega=0.2):
-        weak = self.weak_energy(src_rotation, src_rvelocity, src_height, rho)
-        ee = self.ee_energy(src_height, src_rotation)
+        src_rotation = torch.tensor(src_rotation).to(device)
+        weak = self.weak_energy(src_rotation, torch.tensor(src_rvelocity).to(device), src_height, rho)
+        ee = 0#self.ee_energy(src_height, src_rotation)
 
         return weak + omega * ee
 
     def weak_energy(self, src_rotation, src_rvelocity, src_height, rho):
         L2_rot = 0
         for i in range(len(src_rotation)):
-            L2_rot += torch.dist(self.joint_quat[i], src_rotation[i]) ** 2
+            L2_rot =  L2_rot + torch.dist(self.joint_quat[i], src_rotation[i]) ** 2
         scaled_rvel = src_rvelocity * (self.height/src_height)
         L2_vel = torch.dist(self.prev_root_velocity, scaled_rvel) ** 2
         
@@ -296,7 +298,7 @@ class BaseModel(nn.Module):
         for idx in ee_idx:
             src = src_rotation[idx] / src_height
             tgt = self.joint_quat[idx] / self.height
-            jsum += torch.dist(src,tgt) ** 2
+            jsum = jsum + torch.dist(src,tgt) ** 2
 
         return jsum
 
@@ -306,21 +308,6 @@ class BaseModel(nn.Module):
         #print(sequence)
         frame_rotations = sequence.local_quats  # [num_joints, 4]
         frame_velocity = sequence.root_pos - sequence.root_pos # [3]
-        #joints = []
-        #for i in range(22):
-        #    joint_quat, joint_pos = quat.fk(frame_rotations[i], self.target_joint_offset[0], self.skeleton[0])
-        #    joints.append(quat.quaternion_to_euler(joint_quat))
-        #self.jclip.append(joints)
-        print(sequence.root_pos, self.target_joint_offset[0])
-        '''
-        self.skinned_verts = linear_blend_skinning(torch.tensor(sequence.skeleton.pre_xforms,dtype=torch.float32).to(device), 
-                                                   sequence.skeleton.parent_idx, 
-                                                   torch.tensor(sequence.root_pos,dtype=torch.float32).to(device), 
-                                                   torch.tensor(self.target_joint_offset,dtype=torch.float32).to(device), 
-                                                   torch.tensor(sequence.local_quats,dtype=torch.float32).unsqueeze(0).to(device), 
-                                                   torch.tensor(self.ref_vpos,dtype=torch.float32).to(device), 
-                                                   torch.tensor(self.target_skinning,dtype=torch.float32).to(device))
-        #'''
 
         #'''
         self.skinned_verts = linear_blend_skinning_2(self.skeleton, 
@@ -332,12 +319,7 @@ class BaseModel(nn.Module):
                                                    self.target_skinning).squeeze(0)
         #self.skinned_verts[:,1] = self.skinned_verts[:,1] + sequence.root_pos[1] * 1.5
         #'''
-        
 
-
-        #vertex_positions = self.skinning_layer(self.target_skinning[0], self.target_joint_offset[0], self.ref_vpos)
-
-        #self.clip.append(vertex_positions)
         
     def printtype(self,t):
         print(type(t))

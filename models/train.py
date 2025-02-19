@@ -3,6 +3,8 @@ import torch
 from basemodel import BaseModel
 from dataloader import PrepDataloader
 
+torch.autograd.set_detect_anomaly(True)
+
 params = {
     'src_chars' : ['Remy'],
     'tgt_chars' : ['Remy']
@@ -29,56 +31,54 @@ def train_model(params, epoches=1000, warmup_epochs=50):
                         torch.tensor(tris).to(device="cuda"),
                         height)
 
-        k = 0
         for epoch in tqdm(range(epoches), desc="Epoch", leave=False): #epoch 설정에 따른 for 분기
-
-            batch_sequences, batch_contacts = dataloader.getanim(k) #각 애니메이션 클립으로부터 만들어진 batch로 인한 분기
-            k = (k+1) % num_motion
-
-            num_frames = len(batch_sequences)
-
-            for frame_idx in range(num_frames): #해당 애니메이션 내부의 각 프레임에서 처리되는 분기
+            for step, motions in enumerate(dataloader):
+                batch_sequences, batch_contacts = motions[0][step%num_motion], motions[1][step%num_motion] #각 애니메이션 클립으로부터 만들어진 batch로 인한 분기
                 
-                # Process single frame
-                frame_gp, frame_vp = model(batch_sequences[frame_idx], batch_sequences[max(frame_idx-1,0)].root_pos)
-                #model.testfoward(batch_sequences[0], batch_sequences[0].root_pos)
-                
-                print(f"exec dfc at frame{frame_idx}")
-                frame_contacts = model.detect_frame_contacts(frame_vp)
-                ref_contacts = [0]
+                num_frames = len(batch_sequences)
 
-                #if frame_contacts != []:
-                #    print(f"contacts: {len(frame_contacts)}")
+                for frame_idx in range(num_frames): #해당 애니메이션 내부의 각 프레임에서 처리되는 분기
+                    # Process single frame
+                    frame_gp, frame_vp = model(batch_sequences[frame_idx], batch_sequences[max(frame_idx-1,0)].root_pos)
+                    #model.testfoward(batch_sequences[0], batch_sequences[0].root_pos)
+                    
+                    print(f"exec dfc at frame{frame_idx}")
+                    frame_contacts = model.detect_frame_contacts(frame_vp)
+                    print("donecontactext")
+                    ref_contacts = [0]
+                    
+                    #if frame_contacts != []:
+                    #    print(f"contacts: {len(frame_contacts)}")
 
-                for contacts in batch_contacts:
-                    if frame_idx == contacts[0]:
-                        ref_contacts = contacts[1:]
-                        break
-                
-                #'''
-                # Compute loss for current frame
-                frame_energy = model.energy_fuction(frame_vp, ref_contacts, frame_contacts, MGD,
-                                                    batch_sequences[frame_idx], batch_sequences[frame_idx].root_pos - batch_sequences[max(frame_idx-1,0)].root_pos, height,
-                                                    lamb=0.5, beta=0.9, gamma=0.2, rho=0.9, omega=0.2
-                                                    )
-                
-                #'''
+                    for contacts in batch_contacts:
+                        if frame_idx == contacts[0]:
+                            ref_contacts = contacts[1:]
+                            break
+                    print("contacts len:",len(contacts))
+                    #'''
+                    # Compute loss for current frame
+                    frame_energy = model.energy_fuction(frame_vp, ref_contacts, frame_contacts, MGD,
+                                                        batch_sequences[frame_idx].local_quats, batch_sequences[frame_idx].root_pos - batch_sequences[max(frame_idx-1,0)].root_pos, height,
+                                                        lamb=0.5, beta=0.9, gamma=0.2, rho=0.9, omega=0.2
+                                                        )
+                    #'''
 
-                #if epoch > warmup_epochs:
-                #    model.enc_optim()
+                    #energy = model.ee_energy(height, torch.tensor(batch_sequences[frame_idx].local_quats).cuda())
+                    
 
-                # Backward pass and optimize
-                optimizer.zero_grad()
-                frame_energy.backward()
-                optimizer.step()
-                print("Step")
-                # Frame-wise encoder space optimization
+                    #if epoch > warmup_epochs:
+                    #    model.enc_optim()
+
+                    # Backward pass and optimize
+                    optimizer.zero_grad()
+                    frame_energy.backward(retain_graph=False)
+                    optimizer.step()
+                    print("Step")
+                    # Frame-wise encoder space optimization
+                    
                 
-            
-                #model.saveanim(batch_sequences)
-                break
-            break
-        break
+                    #model.saveanim(batch_sequences)
+
 
 
             

@@ -3,22 +3,55 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
+
 @dataclass
 class AABB:
     min_bound: torch.Tensor  # [..., 3]
     max_bound: torch.Tensor  # [..., 3]
     
     def intersects_batch(self, other: 'AABB') -> torch.Tensor:
-        """배치 방식으로 AABB 교차 검사"""
         return torch.all(self.min_bound <= other.max_bound[..., None, :], dim=-1) & \
                torch.all(other.min_bound <= self.max_bound[..., None, :], dim=-1)
+    
+    def get_size(self) -> torch.Tensor:
+        return self.max_bound - self.min_bound
 
 def compute_triangle_aabbs_batch(vertices: torch.Tensor, triangles: torch.Tensor) -> AABB:
-    """배치 방식으로 모든 삼각형의 AABB를 한 번에 계산"""
     triangle_vertices = vertices[triangles]  # [N, 3, 3]
     min_bounds = torch.min(triangle_vertices, dim=1)[0]  # [N, 3]
     max_bounds = torch.max(triangle_vertices, dim=1)[0]  # [N, 3]
     return AABB(min_bounds, max_bounds)
+
+def compute_node_aabb(vertices: torch.Tensor, triangles: torch.Tensor, triangle_indices: torch.Tensor) -> AABB:
+    """노드에 포함된 모든 삼각형을 감싸는 단일 AABB를 계산"""
+    triangle_vertices = vertices[triangles[triangle_indices]]  # [N, 3, 3]
+    min_bounds = torch.min(triangle_vertices.reshape(-1, 3), dim=0)[0]  # [3]
+    max_bounds = torch.max(triangle_vertices.reshape(-1, 3), dim=0)[0]  # [3]
+    return AABB(min_bounds, max_bounds)
+
+@dataclass
+class BVHNode:
+    aabb: AABB
+    triangle_indices: torch.Tensor
+    left: Optional['BVHNode'] = None
+    right: Optional['BVHNode'] = None
+    
+    @property
+    def is_leaf(self) -> bool:
+        return self.left is None and self.right is None
+    
+    def get_leaf_node_indices(self) -> List[torch.Tensor]:
+        """이 노드 아래의 모든 리프 노드의 삼각형 인덱스들을 수집"""
+        if self.is_leaf:
+            return [self.triangle_indices]
+        
+        indices = []
+        if self.left:
+            indices.extend(self.left.get_leaf_node_indices())
+        if self.right:
+            indices.extend(self.right.get_leaf_node_indices())
+        return indices
+
 
 def check_triangle_adjacency(triangles: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
     """삼각형 쌍이 서로 인접(버텍스를 공유)하는지 배치 방식으로 검사
@@ -42,74 +75,52 @@ def check_triangle_adjacency(triangles: torch.Tensor, pairs: torch.Tensor) -> to
     shared_vertices = (tri1_expanded == tri2_expanded).any(dim=2).any(dim=1)  # [M]
     
     return shared_vertices
+ 
+def build_bvh_recursive(vertices: torch.Tensor, triangles: torch.Tensor, 
+                       triangle_indices: torch.Tensor, depth: int = 0, max_depth: int = 20, 
+                       min_triangles: int = 4) -> BVHNode:
+    """재귀적으로 BVH를 구축하는 함수"""
+    # 노드의 AABB 계산 (모든 삼각형을 포함하는 단일 박스)
+    node_aabb = compute_node_aabb(vertices, triangles, triangle_indices)
+    node = BVHNode(aabb=node_aabb, triangle_indices=triangle_indices)
+    
+    # 종료 조건
+    if len(triangle_indices) <= min_triangles or depth >= max_depth:
+        return node
+        
+    # 삼각형의 중심점 계산
+    tri_vertices = vertices[triangles[triangle_indices]]
+    centroids = torch.mean(tri_vertices, dim=1)
+    
+    # 분할 축 결정 (가장 긴 축 선택)
+    node_size = node_aabb.get_size()  # 이제 크기 [3]의 텐서
+    split_axis = torch.argmax(node_size)
+    
+    # 중심점 기준 정렬 및 분할
+    centroid_values = centroids[:, split_axis]
+    sorted_indices = torch.argsort(centroid_values)
+    mid = len(sorted_indices) // 2
+    
+    left_indices = triangle_indices[sorted_indices[:mid]]
+    right_indices = triangle_indices[sorted_indices[mid:]]
+    
+    # 재귀적으로 자식 노드 구축
+    node.left = build_bvh_recursive(vertices, triangles, left_indices, depth + 1, max_depth, min_triangles)
+    node.right = build_bvh_recursive(vertices, triangles, right_indices, depth + 1, max_depth, min_triangles)
 
-def build_parallel_bvh(vertices: torch.Tensor, triangles: torch.Tensor, max_depth: int = 20):
-    """병렬화된 BVH 구축
-    
-    각 레벨의 노드들을 배치로 처리하여 GPU 병렬성을 활용
-    """
-    num_triangles = triangles.shape[0]
-    
-    # 초기 AABB들을 한 번에 계산
-    aabbs = compute_triangle_aabbs_batch(vertices, triangles)
-    
-    # 각 레벨별 노드 정보를 저장할 리스트
-    level_nodes = [{
-        'aabbs': aabbs,
-        'triangle_indices': torch.arange(num_triangles, device=vertices.device),
-        'is_leaf': torch.ones(num_triangles, dtype=torch.bool, device=vertices.device)
-    }]
-    
-    for depth in range(max_depth):
-        current_level = level_nodes[-1]
-        if torch.all(current_level['is_leaf']):
-            break
-            
-        # 중심점 계산을 배치로 수행
-        tri_vertices = vertices[triangles[current_level['triangle_indices']]]
-        centroids = torch.mean(tri_vertices, dim=1)
-        
-        # 분할 축 결정을 배치로 수행
-        extent = torch.max(centroids, dim=0)[0] - torch.min(centroids, dim=0)[0]
-        split_axis = torch.argmax(extent)
-        
-        # 중심점 기준 정렬을 배치로 수행
-        centroid_values = centroids[:, split_axis]
-        sorted_indices = torch.argsort(centroid_values)
-        
-        # 분할 위치 계산
-        mid = len(sorted_indices) // 2
-        
-        # 자식 노드들의 정보 업데이트
-        left_indices = current_level['triangle_indices'][sorted_indices[:mid]]
-        right_indices = current_level['triangle_indices'][sorted_indices[mid:]]
-        
-        # 새로운 레벨의 노드 정보 생성
-        next_level = {
-            'aabbs': compute_triangle_aabbs_batch(vertices, triangles[torch.cat([left_indices, right_indices])]),
-            'triangle_indices': torch.cat([left_indices, right_indices]),
-            'is_leaf': torch.cat([
-                torch.ones(mid, dtype=torch.bool, device=vertices.device),
-                torch.ones(len(sorted_indices) - mid, dtype=torch.bool, device=vertices.device)
-            ])
-        }
-        
-        level_nodes.append(next_level)
-    
-    return level_nodes
+    return node
 
 def parallel_triangle_intersection(vertices: torch.Tensor, 
                                 triangles: torch.Tensor,
-                                pairs: torch.Tensor) -> torch.Tensor:
-    """배치 방식으로 여러 삼각형 쌍의 교차 검사를 동시에 수행"""
-    # 삼각형 쌍의 꼭지점 추출
+                                pairs: torch.Tensor,
+                                epsilon: float = 1e-6) -> torch.Tensor:
+    """개선된 삼각형 교차 검사"""
     tri1_idx = pairs[:, 0]
     tri2_idx = pairs[:, 1]
     
     v1 = vertices[triangles[tri1_idx]]  # [N, 3, 3]
     v2 = vertices[triangles[tri2_idx]]  # [N, 3, 3]
     
-    # 에지 벡터와 법선 계산을 배치로 수행
     e1 = v1[:, 1] - v1[:, 0]  # [N, 3]
     e2 = v1[:, 2] - v1[:, 0]  # [N, 3]
     n1 = torch.cross(e1, e2, dim=1)  # [N, 3]
@@ -118,27 +129,39 @@ def parallel_triangle_intersection(vertices: torch.Tensor,
     f2 = v2[:, 2] - v2[:, 0]  # [N, 3]
     n2 = torch.cross(f1, f2, dim=1)  # [N, 3]
     
-    # 분리축 후보들을 배치로 계산
-    axes = torch.stack([
-        n1, n2,
-        torch.cross(e1, f1, dim=1),
-        torch.cross(e1, f2, dim=1),
-        torch.cross(e2, f1, dim=1),
-        torch.cross(e2, f2, dim=1)
-    ], dim=1)  # [N, 6, 3]
+    # 법선 벡터 정규화
+    n1_norm = torch.norm(n1, dim=1, keepdim=True)
+    n2_norm = torch.norm(n2, dim=1, keepdim=True)
+    valid_normals = (n1_norm > epsilon) & (n2_norm > epsilon)
+    n1 = torch.where(valid_normals, n1 / n1_norm, n1)
+    n2 = torch.where(valid_normals, n2 / n2_norm, n2)
     
-    # 각 축에 대한 투영 구간을 배치로 계산
+    # 분리축 후보들 계산 및 정규화
+    axes = []
+    axes.append(n1)
+    axes.append(n2)
+    
+    # 에지 크로스 프로덕트 계산 및 정규화
+    for e in [e1, e2]:
+        for f in [f1, f2]:
+            cross = torch.cross(e, f, dim=1)
+            cross_norm = torch.norm(cross, dim=1, keepdim=True)
+            valid_cross = cross_norm > epsilon
+            normalized_cross = torch.where(valid_cross, cross / cross_norm, cross)
+            axes.append(normalized_cross)
+    
+    axes = torch.stack(axes, dim=1)  # [N, 6, 3]
+    
     intersecting = torch.ones(pairs.shape[0], dtype=torch.bool, device=vertices.device)
     
-    for i in range(6):
+    for i in range(axes.shape[1]):
         axis = axes[:, i]  # [N, 3]
         axis_norm = torch.norm(axis, dim=1)
-        valid_axis = axis_norm > 1e-10
+        valid_axis = axis_norm > epsilon
         
         if not torch.any(valid_axis):
             continue
             
-        # 투영 계산을 배치로 수행
         p1 = torch.bmm(v1, axis.unsqueeze(2)).squeeze(-1)  # [N, 3]
         p2 = torch.bmm(v2, axis.unsqueeze(2)).squeeze(-1)  # [N, 3]
         
@@ -147,45 +170,82 @@ def parallel_triangle_intersection(vertices: torch.Tensor,
         min2, _ = torch.min(p2, dim=1)  # [N]
         max2, _ = torch.max(p2, dim=1)  # [N]
         
-        # 분리축 테스트를 배치로 수행
-        intersecting &= ((max1 >= min2) & (max2 >= min1)) | ~valid_axis
+        gap = torch.min(max1 - min2, max2 - min1)
+        intersecting &= ((gap >= -epsilon) | ~valid_axis)
     
     return intersecting
 
-def find_collisions_parallel(vertices: torch.Tensor,
-                           triangles: torch.Tensor,
-                           level_nodes: List[dict]) -> List[Tuple[int, int]]:
-    """병렬화된 충돌 검출"""
-    device = vertices.device
-    num_triangles = triangles.shape[0]
+def find_collisions_parallel_batched(vertices: torch.Tensor,
+                                   triangles: torch.Tensor,
+                                   root: BVHNode,
+                                   batch_size: int = 10000) -> List[Tuple[int, int]]:
+    """계층적 BVH와 배치 처리를 결합한 충돌 검출"""
+    print("startFCPB")
+
+    # 리프 노드들의 인덱스 수집
+    leaf_indices_lists = root.get_leaf_node_indices()
     
-    # 모든 가능한 삼각형 쌍 생성
-    tri_indices = torch.arange(num_triangles, device=device)
-    pairs = torch.combinations(tri_indices, r=2)  # [N*(N-1)/2, 2]
+
+    # 리프 노드들의 AABB 계산
+    leaf_aabbs = [compute_node_aabb(vertices, triangles, indices) for indices in leaf_indices_lists]
     
-    # AABB 교차 테스트를 배치로 수행
-    aabbs = level_nodes[0]['aabbs']
-    aabb_intersecting = aabbs.intersects_batch(aabbs)  # [N, N]
+    # 모든 리프 노드들의 AABB를 하나의 텐서로 모음
+    min_bounds = torch.stack([aabb.min_bound for aabb in leaf_aabbs])  # [N, 3]
+    max_bounds = torch.stack([aabb.max_bound for aabb in leaf_aabbs])  # [N, 3]
     
-    # 상삼각 행렬만 사용
-    aabb_intersecting = torch.triu(aabb_intersecting, diagonal=1)
-    potential_collisions = torch.nonzero(aabb_intersecting)
+    # 모든 AABB 쌍을 한 번에 비교
+    all_aabb = AABB(min_bounds, max_bounds)
+    intersecting_matrix = all_aabb.intersects_batch(all_aabb)  # [N, N]
     
-    if len(potential_collisions) == 0:
+    # 상삼각 행렬만 사용 (중복 제거)
+    intersecting_matrix = torch.triu(intersecting_matrix, diagonal=1)
+    intersecting_pairs = torch.nonzero(intersecting_matrix)  # [M, 2]
+    
+    # 메모리 효율적인 배치 처리
+    final_collisions = []
+    batch_size = 1000  # AABB 쌍 배치 크기
+    
+    print("startcreatingpairs, IPlen: ", len(intersecting_pairs))
+    for batch_start in range(0, len(intersecting_pairs), batch_size):
+        batch_end = min(batch_start + batch_size, len(intersecting_pairs))
+        batch_pairs = intersecting_pairs[batch_start:batch_end]
+        
+        # 현재 배치의 삼각형 쌍 생성
+        batch_collision_pairs = []
+        for i, j in batch_pairs:
+            pairs = torch.cartesian_prod(leaf_indices_lists[i], leaf_indices_lists[j])
+            # 자기 자신과의 충돌은 즉시 제외
+            valid_pairs = pairs[:, 0] != pairs[:, 1]
+            pairs = pairs[valid_pairs]
+            if len(pairs) > 0:
+                batch_collision_pairs.append(pairs)
+        
+        if not batch_collision_pairs:
+            continue
+            
+        # 배치 내의 모든 쌍 합치기
+        all_pairs = torch.cat(batch_collision_pairs, dim=0)
+    
+    if len(all_pairs) == 0:
         return []
     
     # 인접한 삼각형 제외
-    non_adjacent = ~check_triangle_adjacency(triangles, potential_collisions)
-    potential_collisions = potential_collisions[non_adjacent]
+    non_adjacent = ~check_triangle_adjacency(triangles, all_pairs)
+    all_pairs = all_pairs[non_adjacent]
     
-    if len(potential_collisions) == 0:
+    if len(all_pairs) == 0:
         return []
     
-    # 실제 삼각형 교차 테스트를 배치로 수행
-    intersecting = parallel_triangle_intersection(vertices, triangles, potential_collisions)
-    collision_pairs = potential_collisions[intersecting]
+    # 배치 크기로 나누어 처리
+    print("startfindingintersections")
+    final_collisions = []
+    for i in range(0, len(all_pairs), batch_size):
+        batch_pairs = all_pairs[i:i + batch_size]
+        intersecting = parallel_triangle_intersection(vertices, triangles, batch_pairs)
+        collision_batch = batch_pairs[intersecting]
+        final_collisions.extend([(int(i), int(j)) for i, j in collision_batch.cpu().numpy()])
     
-    return [(int(i), int(j)) for i, j in collision_pairs.cpu().numpy()]
+    return final_collisions
 
 def detect_mesh_collisions_parallel(vertices: torch.Tensor, triangles: torch.Tensor):
     """병렬화된 메시 충돌 검출"""
@@ -193,11 +253,14 @@ def detect_mesh_collisions_parallel(vertices: torch.Tensor, triangles: torch.Ten
     vertices = vertices.cuda()
     triangles = triangles.cuda()
     
-    # 병렬 BVH 구축
-    level_nodes = build_parallel_bvh(vertices, triangles)
+    # 초기 삼각형 인덱스
+    triangle_indices = torch.arange(triangles.shape[0], device=vertices.device)
     
-    # 병렬 충돌 검출
-    return find_collisions_parallel(vertices, triangles, level_nodes)
+    # BVH 구축 (계층적)
+    root = build_bvh_recursive(vertices, triangles, triangle_indices)
+    
+    # 병렬 배치 처리로 충돌 검출
+    return find_collisions_parallel_batched(vertices, triangles, root)
 
 # 테스트
 if __name__ == "__main__":
