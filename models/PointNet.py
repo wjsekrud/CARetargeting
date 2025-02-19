@@ -1,153 +1,177 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 
-class TNet(nn.Module):
-    """Transform Net for input transformation"""
-    def __init__(self, k=3):
-        super().__init__()
-        self.k = k
-        
-        # Shared MLP
-        self.conv1 = nn.Conv1d(k, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, 1024, 1)
-        
-        # MLP for transform matrix
-        self.fc1 = nn.Linear(1024, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, k*k)
-        
-        # Initialize last layer with zeros + identity matrix
-        self.fc3.weight.data.zero_()
-        self.fc3.bias.data.copy_(torch.eye(k).view(-1))
-        
-    def forward(self, x):
-        batch_size = x.size(0)
-        
-        # (batch_size, k, num_points)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        
-        # Max pooling
-        x = torch.max(x, 2, keepdim=True)[0]
-        x = x.view(-1, 1024)
-        
-        # MLP
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        
-        # Reshape to transform matrix
-        identity = torch.eye(self.k).view(1, self.k*self.k).repeat(batch_size, 1)
-        if x.is_cuda:
-            identity = identity.cuda()
-        x = x + identity
-        x = x.view(-1, self.k, self.k)
-        
-        return x
+def compute_parent_joint_offsets(vertices, skinning_weights, joint_positions):
+    """
+    Compute offsets from each vertex to its parent joint
+    Args:
+        vertices: [B, N, 3] vertex positions
+        skinning_weights: [B, N, J] skinning weights
+        joint_positions: [B, J, 3] joint positions
+    Returns:
+        offsets: [B, N, 3] offset vectors from parent joints to vertices
+        parent_indices: [B, N] indices of parent joints
+    """
+    # Find parent joint indices (joint with maximum weight for each vertex)
+    parent_indices = torch.argmax(skinning_weights, dim=2)  # [B, N]
+    
+    # Gather parent joint positions
+    batch_size, num_vertices = vertices.shape[:2]
+    batch_indices = torch.arange(batch_size).view(-1, 1).expand(-1, num_vertices)
+    vertex_indices = torch.arange(num_vertices).view(1, -1).expand(batch_size, -1)
+    
+    parent_positions = joint_positions[batch_indices, parent_indices]  # [B, N, 3]
+    
+    # Compute offsets
+    offsets = vertices - parent_positions
+    
+    return offsets, parent_indices
 
-class VertexFeatureExtractor(nn.Module):
-    """Feature extractor for mesh vertices based on PointNet architecture"""
-    def __init__(self, num_joints):
+class VertexEncoder(nn.Module):
+    def __init__(self, num_joints, feature_dim=128):
         super().__init__()
-        self.num_joints = num_joints
+        self.feature_dim = feature_dim
         
-        # Input transform net (3D coordinates)
-        self.stn = TNet(k=3)
+        # Input dimensions: position (3) + skinning weights (num_joints) + parent offset (3)
+        input_dim = 3 + num_joints + 3
         
-        # Feature transform net
-        self.fstn = TNet(k=64)
-        
-        # Skinning weights processing
-        self.skinning_mlp = nn.Sequential(
-            nn.Linear(num_joints, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU()
-        )
-        
-        # Shared MLP layers
-        self.conv1 = nn.Conv1d(3, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, 1024, 1)
-        
-        # Batch normalization
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-        
-        # Final MLP for per-vertex features
         self.mlp = nn.Sequential(
-            nn.Linear(1024 + 64, 512),
+            nn.Linear(input_dim, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Linear(256, 128)
+            nn.Linear(512, feature_dim)
         )
-        
-    def forward(self, vertices, skinning_weights):
-        batch_size = vertices.size(0)
-        num_points = vertices.size(1)
-        
-        # Transform input vertices
-        trans = self.stn(vertices.transpose(2, 1))
-        vertices = torch.bmm(vertices, trans)
-        
-        # Process vertices through shared MLP
-        x = vertices.transpose(2, 1)
-        x = F.relu(self.bn1(self.conv1(x)))
-        
-        # Feature transform
-        trans_feat = self.fstn(x)
-        x = torch.bmm(x.transpose(2, 1), trans_feat).transpose(2, 1)
-        
-        # Continue with shared MLP
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.bn3(self.conv3(x))
-        
-        # Process skinning weights
-        skinning_features = self.skinning_mlp(skinning_weights)
-        
-        # Global feature vector
-        global_feat = torch.max(x, 2, keepdim=True)[0]
-        global_feat = global_feat.view(-1, 1024)
-        
-        # Concatenate global features with skinning features
-        combined_features = torch.cat([
-            global_feat.unsqueeze(1).repeat(1, num_points, 1),
-            skinning_features
-        ], dim=2)
-        
-        # Final per-vertex features
-        vertex_features = self.mlp(combined_features.view(-1, 1024 + 64))
-        vertex_features = vertex_features.view(batch_size, num_points, -1)
-        
-        return vertex_features
+    
+    def forward(self, vertices, skinning_weights, parent_offsets):
+        # Concatenate all inputs
+        x = torch.cat([vertices, skinning_weights, parent_offsets], dim=-1)
+        x = x.view(-1, x.size(-1))
+        features = self.mlp(x)
+        features = features.view(*vertices.shape[:-1], -1)
+        global_features = torch.max(features, dim=1)[0]
+        return features, global_features
 
-# Example usage
-def test_model():
-    # Create sample data
+class VertexDecoder(nn.Module):
+    def __init__(self, feature_dim=128):
+        super().__init__()
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Linear(512, 3)  # Only reconstruct vertex positions
+        )
+    
+    def forward(self, features):
+        x = features.view(-1, features.size(-1))
+        vertices = self.mlp(x)
+        vertices = vertices.view(*features.shape[:-1], 3)
+        return vertices
+
+class MeshAutoEncoder(nn.Module):
+    def __init__(self, num_joints, feature_dim=128):
+        super().__init__()
+        self.encoder = VertexEncoder(num_joints, feature_dim)
+        self.decoder = VertexDecoder(feature_dim)
+    
+    def forward(self, vertices, skinning_weights, parent_offsets):
+        features, global_features = self.encoder(vertices, skinning_weights, parent_offsets)
+        reconstructed_vertices = self.decoder(features)
+        return features, reconstructed_vertices
+
+class FeatureLearningFramework:
+    def __init__(self, num_joints, feature_dim=128, learning_rate=1e-4):
+        self.model = MeshAutoEncoder(num_joints, feature_dim)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+    
+    def compute_losses(self, vertices, skinning_weights, parent_offsets, features, reconstructed_vertices):
+        # Reconstruction loss
+        reconstruction_loss = F.mse_loss(reconstructed_vertices, vertices)
+        
+        # Feature consistency loss
+        # Similar vertices (based on skinning weights and parent joints) should have similar features
+        skinning_similarity = torch.bmm(skinning_weights, skinning_weights.transpose(1, 2))
+        
+        # Add parent joint similarity (vertices with same parent should have more similar features)
+        parent_indices = torch.argmax(skinning_weights, dim=2)
+        parent_similarity = (parent_indices.unsqueeze(-1) == parent_indices.unsqueeze(1)).float()
+        
+        # Combine similarities
+        vertex_similarity = (skinning_similarity + parent_similarity) / 2
+        feature_similarity = torch.bmm(features, features.transpose(1, 2))
+        consistency_loss = F.mse_loss(feature_similarity, vertex_similarity)
+        
+        # Feature norm loss
+        feature_norm_loss = torch.mean(torch.norm(features, dim=2))
+        
+        total_loss = reconstruction_loss #+ 0.1 * consistency_loss + 0.01 * feature_norm_loss
+        
+        return {
+            'total': total_loss,
+            'reconstruction': reconstruction_loss,
+            'consistency': 0,
+            'feature_norm': 0
+        }
+    
+    def train_step(self, vertices, skinning_weights, joint_positions):
+        self.optimizer.zero_grad()
+        
+        # Compute parent joint offsets
+        parent_offsets, _ = compute_parent_joint_offsets(vertices, skinning_weights, joint_positions)
+        
+        # Forward pass
+        features, reconstructed_vertices = self.model(vertices, skinning_weights, parent_offsets)
+        
+        # Compute losses
+        losses = self.compute_losses(vertices, skinning_weights, parent_offsets, 
+                                   features, reconstructed_vertices)
+        
+        # Backward pass
+        losses['total'].backward()
+        self.optimizer.step()
+        
+        return losses
+    
+    def extract_features(self, vertices, skinning_weights, joint_positions):
+        """Use this after training to extract features using only the encoder"""
+        with torch.no_grad():
+            parent_offsets, _ = compute_parent_joint_offsets(vertices, skinning_weights, joint_positions)
+            features, global_features = self.model.encoder(vertices, skinning_weights, parent_offsets)
+        return features, global_features
+
+def test_framework():
+    # Test parameters
     batch_size = 2
-    num_points = 1024
+    num_vertices = 1024
     num_joints = 24
     
-    vertices = torch.randn(batch_size, num_points, 3)
-    skinning_weights = torch.randn(batch_size, num_points, num_joints)
+    # Create sample data
+    vertices = torch.randn(batch_size, num_vertices, 3)
+    skinning_weights = torch.randn(batch_size, num_vertices, num_joints)
     skinning_weights = F.softmax(skinning_weights, dim=-1)  # Normalize weights
+    joint_positions = torch.randn(batch_size, num_joints, 3)
     
-    # Initialize model
-    model = VertexFeatureExtractor(num_joints=num_joints)
+    # Initialize framework
+    framework = FeatureLearningFramework(num_joints)
     
-    # Forward pass
-    features = model(vertices, skinning_weights)
-    print(f"Input vertices shape: {vertices.shape}")
-    print(f"Input skinning weights shape: {skinning_weights.shape}")
-    print(f"Output features shape: {features.shape}")
+    # Test forward pass
+    losses = framework.train_step(vertices, skinning_weights, joint_positions)
     
-    return features
+    print("Test forward pass completed")
+    print("Losses:", {k: v.item() for k, v in losses.items()})
+    
+    # Test feature extraction
+    features, global_features = framework.extract_features(vertices, skinning_weights, joint_positions)
+    print(f"\nExtracted features shape: {features.shape}")
+    print(f"Global features shape: {global_features.shape}")
 
 if __name__ == "__main__":
-    test_model()
+    test_framework()

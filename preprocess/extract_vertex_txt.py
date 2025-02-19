@@ -12,10 +12,11 @@ class NewVertexExporter:
         self.vertex_groups = mesh_obj.vertex_groups
         self.mesh = mesh_obj.data
         self.global_scale = scale
-        self.end_effectors = ['mixamorig:Head', 'mixamorig:LeftHand', 'mixamorig:RightHand', 'mixamorig:LeftToeBase', 'mixamorig:RightToeBase']
+        self.end_effectors = ['Head', 'LeftHand', 'RightHand', 'LeftToeBase', 'RightToeBase']
 
     def calculate_geodesic_distance(self):
         # bmesh 생성
+        print("start CGD")
         bm = bmesh.new()
         bm.from_mesh(self.mesh)
         bm.edges.ensure_lookup_table()
@@ -58,7 +59,6 @@ class NewVertexExporter:
         representative_vertices = {}
         max_geodesic_distance = 0
         processed_pairs = set()
-
         bm.verts.ensure_lookup_table()
         for i, (name1, vertices1) in enumerate(end_effector_vertices.items()):
             for name2, vertices2 in list(end_effector_vertices.items())[i+1:]:
@@ -187,6 +187,7 @@ class NewVertexExporter:
         """단순 텍스트 형식으로 파일 저장"""
         with open(output_path, 'w') as f:
             max_geodesic = self.calculate_geodesic_distance()
+            print(max_geodesic)
 
             f.write(f"Height: {self.get_mesh_height()}\n")
             f.write(f"MaxGeodesicDistance: {max_geodesic}\n")
